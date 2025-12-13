@@ -1,0 +1,4 @@
+context/
+*.png
+skymaps/
+*.npz
