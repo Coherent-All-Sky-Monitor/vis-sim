@@ -11,6 +11,7 @@ from astropy.coordinates import EarthLocation, AltAz, SkyCoord, get_sun
 from scipy.interpolate import griddata
 from astropy.time import Time
 from pytz import timezone
+from datetime import datetime
 import pygdsm
 import healpy as hp
 from scipy.spatial.distance import cdist
@@ -795,7 +796,7 @@ def main():
     parser.add_argument('--n-channels', type=int, default=100,
                        help='Number of frequency channels (default: 100)')
     parser.add_argument('--time', type=str, default=None,
-                       help='Observation time in ISO format (default: current time)')
+                       help='Observation time. Formats: HH:MM (PST today) OR ISO-8601 (YYYY-MM-DDTHH:MM:SS)')
     
     parser.add_argument('--test-baselines', action='store_true',
                        help='Run in test mode: select max NS and EW baselines only (default: False)')
@@ -807,8 +808,38 @@ def main():
     print("=" * 60)
     
     # Set observation time
+    pst = timezone('America/Los_Angeles')
+    
     if args.time:
-        time_obs = Time(args.time)
+        # 1. Try ISO format (Astropy Time)
+        try:
+            time_obs = Time(args.time)
+            print(f"   Parsed explicit time: {args.time}")
+        except ValueError:
+            # 2. Try HH:MM format (PST Today)
+            try:
+                # Get current date in PST
+                now_pst = datetime.now(pst)
+                
+                # Parse input time string
+                parts = list(map(int, args.time.split(':')))
+                if len(parts) == 2:
+                    hour, minute = parts
+                    second = 0
+                elif len(parts) == 3:
+                    hour, minute, second = parts
+                else:
+                    raise ValueError
+                
+                # Create observation datetime
+                obs_dt = now_pst.replace(hour=hour, minute=minute, second=second, microsecond=0)
+                time_obs = Time(obs_dt)
+                print(f"   Parsed local time (PST): {args.time} -> {obs_dt}")
+                
+            except ValueError:
+                print(f"ERROR: Invalid time format '{args.time}'.")
+                print("       Use ISO-8601 (YYYY-MM-DDTHH:MM:SS) OR HH:MM (24-hr PST today).")
+                return
     else:
         time_obs = Time.now()
     

@@ -50,7 +50,7 @@ python main.py --compvis --test-baselines --n-channels 100
 | `--compvis` | Enable visibility computation (default: False). | `False` |
 | `--test-baselines` | Run in test mode (max NS/EW baselines only). | `False` |
 | `--n-channels N` | Number of frequency channels to simulate. | `100` |
-| `--time "YYYY-MM-DD..."` | Set specific observation time (ISO format). | `Now` |
+| `--time "TIME"` | Observation time. Accepts "HH:MM" (PST Today) OR ISO-8601 "YYYY-MM-DD...". | `Now` |
 
 ## Outputs
 
