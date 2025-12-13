@@ -24,7 +24,7 @@ N_COLS = 6   # East-West
 N_ANTENNAS = N_ROWS * N_COLS  # 30 antennas
 N_POL = 2    # Two polarizations per antenna
 ARRAY_NS_LENGTH = 10.0  # meters (North-South)
-ARRAY_EW_LENGTH = 3.0   # meters (East-West)
+ARRAY_EW_LENGTH = 6.0   # meters (East-West)
 FREQ_MIN = 375.0  # MHz
 FREQ_MAX = 468.0  # MHz (375 + 93 MHz bandwidth)
 FREQ_CENTER = (FREQ_MIN + FREQ_MAX) / 2.0  # MHz
@@ -54,8 +54,8 @@ def generate_antenna_positions():
     Returns positions in local ENU (East-North-Up) coordinates in meters.
     """
     # Create grid indices
-    row_indices = np.arange(N_ROWS)  # 0 to 42
-    col_indices = np.arange(N_COLS)  # 0 to 5
+    row_indices = np.arange(N_ROWS)  # 0 to N_ROWS-1
+    col_indices = np.arange(N_COLS)  # 0 to N_COLS-1
     
     # Calculate spacing
     ns_spacing = ARRAY_NS_LENGTH / (N_ROWS - 1) if N_ROWS > 1 else 0
@@ -392,7 +392,62 @@ def get_primary_beam_attenuation(pixel_directions):
     return attenuation
 
 
-def generate_visibilities(antenna_mapping, frequencies, time_obs=None, n_sky_pixels=None):
+def plot_uv_coverage(uvw, highlight_indices=None, freq_idx=0, save_path=None):
+    """
+    Plot UV coverage for a specific frequency channel.
+    
+    Parameters:
+    -----------
+    uvw : array
+        UVW coordinates, shape (n_baselines, n_freq, 3)
+    highlight_indices : list
+        List of baseline indices to highlight
+    freq_idx : int
+        Frequency index to plot
+    save_path : str
+        Path to save plot
+    """
+    # Extract u, v for the frequency channel (in wavelengths)
+    u_vals = uvw[:, freq_idx, 0]
+    v_vals = uvw[:, freq_idx, 1]
+    
+    # Conjugate points (-u, -v) are symmetric
+    u_all = np.concatenate([u_vals, -u_vals])
+    v_all = np.concatenate([v_vals, -v_vals])
+    
+    plt.figure(figsize=(8, 8))
+    
+    # Plot all points
+    plt.scatter(u_all, v_all, s=5, c='gray', alpha=0.5, label='All Baselines')
+    
+    # Plot highlighted points
+    if highlight_indices is not None:
+        u_high = u_vals[highlight_indices]
+        v_high = v_vals[highlight_indices]
+        
+        # Add symmetric points
+        u_high_all = np.concatenate([u_high, -u_high])
+        v_high_all = np.concatenate([v_high, -v_high])
+        
+        plt.scatter(u_high_all, v_high_all, s=100, c='red', marker='*', label='Test Baselines')
+    
+    plt.xlabel('u (wavelengths)')
+    plt.ylabel('v (wavelengths)')
+    plt.title(f'UV Coverage')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.axis('equal')
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150)
+        print(f"Saved UV coverage plot to {save_path}")
+    else:
+        plt.show()
+    plt.close()
+
+
+def generate_visibilities(antenna_mapping, frequencies, time_obs=None, n_sky_pixels=None, 
+                         custom_baselines=None, custom_baseline_pairs=None):
     """
     Generate simulated visibilities for the CASM array using Van Cittert-Zernike formalism.
     
@@ -406,6 +461,10 @@ def generate_visibilities(antenna_mapping, frequencies, time_obs=None, n_sky_pix
         Observation time (default: current time)
     n_sky_pixels : int
         (Deprecated) Number of sky pixels is determined by nside within get_sky_model
+    custom_baselines : array (optional)
+        Pre-calculated or subset of baselines (meters)
+    custom_baseline_pairs : array (optional)
+        Corresponding antenna pairs
     
     Returns:
     --------
@@ -419,8 +478,13 @@ def generate_visibilities(antenna_mapping, frequencies, time_obs=None, n_sky_pix
     n_ant = antenna_mapping['n_antennas']
     n_freq = len(frequencies)
     
-    # Calculate baselines in meters
-    baselines_meters, baseline_pairs = calculate_baselines(positions)
+    if custom_baselines is not None and custom_baseline_pairs is not None:
+        baselines_meters = custom_baselines
+        baseline_pairs = custom_baseline_pairs
+    else:
+        # Calculate baselines in meters
+        baselines_meters, baseline_pairs = calculate_baselines(positions)
+    
     n_baselines = len(baselines_meters)
     
     # Calculate UVW coordinates [n_baselines, n_freq, 3]
@@ -733,6 +797,9 @@ def main():
     parser.add_argument('--time', type=str, default=None,
                        help='Observation time in ISO format (default: current time)')
     
+    parser.add_argument('--test-baselines', action='store_true',
+                       help='Run in test mode: select max NS and EW baselines only (default: False)')
+    
     args = parser.parse_args()
     
     print("=" * 60)
@@ -787,11 +854,58 @@ def main():
     # Step 5: Generate visibilities (if requested)
     if args.compvis:
         print("\n5. Generating visibilities...")
+        
+        # Prepare inputs
+        calc_baselines = None
+        calc_pairs = None
+        
+        # Test Baselines Mode
+        if args.test_baselines:
+            print("\n   [TEST MODE] Selecting specific baselines...")
+            # Calculate all baselines first
+            all_baselines, all_pairs = calculate_baselines(positions)
+            
+            # Identify indices
+            # Max EW: Ant 0 (0,0) to Ant 5 (0,5) -> Pair [0, 5]
+            # Max NS: Ant 0 (0,0) to Ant 24 (4,0) -> Pair [0, 24]
+            test_indices = []
+            
+            # Ant 0 index = 0
+            # Ant EW Max index = N_COLS - 1 = 5
+            # Ant NS Max index = (N_ROWS - 1) * N_COLS = 24
+            target_pairs = [[0, 5], [0, 24]]
+            print(f"   Looking for pairs: {target_pairs} (indices)")
+            
+            for idx, pair in enumerate(all_pairs):
+                p_list = sorted(list(pair))
+                if p_list == target_pairs[0] or p_list == target_pairs[1]:
+                     test_indices.append(idx)
+            
+            if len(test_indices) != 2:
+                print(f"   WARNING: Could not find all test baselines. Found indices: {test_indices}")
+            else:
+                print(f"   Found test baselines at indices: {test_indices}")
+            
+            # Select subset
+            calc_baselines = all_baselines[test_indices]
+            calc_pairs = all_pairs[test_indices]
+            
+            # Plot UVW Coverage (Contextual)
+            print("   Generating UV coverage plot...")
+            # Calculate UVW for all baselines for context
+            uvw_all = calculate_uvw(all_baselines, frequencies)
+            plot_uv_coverage(uvw_all, highlight_indices=test_indices, freq_idx=len(frequencies)//2, save_path='casm_uv_coverage_test.png')
+            
+        else:
+            print("   Using all baselines.")
+
         vis_data = generate_visibilities(
             antenna_mapping,
             frequencies,
             time_obs=time_obs,
-            n_sky_pixels=1000
+            n_sky_pixels=1000,
+            custom_baselines=calc_baselines,
+            custom_baseline_pairs=calc_pairs
         )
         
         print(f"\n   Generated visibilities:")
@@ -801,9 +915,10 @@ def main():
         print(f"   - Polarizations: {N_POL}x{N_POL}")
         
         # Save results
-        print("\n6. Saving results...")
+        filename = 'casm_visibilities_test.npz' if args.test_baselines else 'casm_visibilities.npz'
+        print(f"\n6. Saving results to {filename}...")
         np.savez_compressed(
-            'casm_visibilities.npz',
+            filename,
             visibilities=vis_data['visibilities'],
             baselines=vis_data['baselines'],
             uvw=vis_data['uvw'],
@@ -814,7 +929,7 @@ def main():
             time_obs=time_obs.iso,
             **antenna_mapping
         )
-        print("   Saved to casm_visibilities.npz")
+        print(f"   Saved to {filename}")
         
         # Print summary statistics
         print("\n7. Visibility Statistics:")
@@ -824,7 +939,7 @@ def main():
         print(f"   Max |V|: {np.max(vis_abs):.6e}")
         print(f"   Min |V|: {np.min(vis_abs):.6e}")
     else:
-        print("\n5. Skipping visibility computation (use --compute-visibilities to enable)")
+        print("\n5. Skipping visibility computation (use --compvis to enable)")
     
     print("\n" + "=" * 60)
     print("Simulation complete!")
