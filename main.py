@@ -11,7 +11,7 @@ from astropy.coordinates import EarthLocation, AltAz, SkyCoord, get_sun
 from scipy.interpolate import griddata
 from astropy.time import Time
 from pytz import timezone
-from datetime import datetime
+from datetime import datetime, timedelta
 import pygdsm
 import healpy as hp
 from scipy.spatial.distance import cdist
@@ -239,9 +239,27 @@ def add_sun_to_sky_model(sky_maps, frequencies, time_obs, sky_coords_icrs, nside
     return sky_maps_sun
 
 
-def get_sky_model(frequencies, time_obs=None, nside=64):
+def generate_base_sky_model(frequencies, nside=64):
     """
-    Generate sky model using pygdsm, add the Sun, and transform to local coordinates.
+    Generate the time-independent component of the sky model (GSM) in Galactic coordinates.
+    """
+    print(f"   Pre-computing GSM background for {len(frequencies)} channels...")
+    gsm = pygdsm.GlobalSkyModel16(freq_unit='MHz', data_unit='TCMB')
+    sky_maps = []
+    
+    for freq in frequencies:
+        sky_map = gsm.generate(freq)
+        map_nside = hp.get_nside(sky_map)
+        if map_nside != nside:
+            sky_map = hp.ud_grade(sky_map, nside)
+        sky_maps.append(sky_map)
+        
+    return np.array(sky_maps)
+
+
+def get_sky_model(frequencies, time_obs=None, nside=64, base_sky_maps=None):
+    """
+    Generate sky model, add the Sun, and transform to local coordinates.
     
     Parameters:
     -----------
@@ -250,7 +268,9 @@ def get_sky_model(frequencies, time_obs=None, nside=64):
     time_obs : Time
         Observation time for coordinate transformation
     nside : int
-        HEALPix nside parameter (higher = finer resolution)
+        HEALPix nside parameter
+    base_sky_maps : array (optional)
+        Pre-computed GSM maps shape (n_freq, n_pixels). If None, will be computed.
     
     Returns:
     --------
@@ -265,29 +285,16 @@ def get_sky_model(frequencies, time_obs=None, nside=64):
         time_obs = Time.now()
     
     # 1. Get all coordinate transformations (ICRS, ENU, AltAz)
+    # This IS time-dependent and must be done every step
     sky_coords_icrs, pixel_directions, pixel_altaz = get_local_coordinates(nside, time_obs)
 
-    # 2. Generate pygdsm background sky model
-    # Initialize pygdsm
-    gsm = pygdsm.GlobalSkyModel16(freq_unit='MHz', data_unit='TCMB')
+    # 2. Get background sky model
+    if base_sky_maps is not None:
+        sky_maps = base_sky_maps.copy() # Copy to avoid modifying the cached constant
+    else:
+        sky_maps = generate_base_sky_model(frequencies, nside)
     
-    # Generate sky model for each frequency
-    sky_maps = []
-    for freq in frequencies:
-        sky_map = gsm.generate(freq)
-        # Get the nside of the generated map
-        map_nside = hp.get_nside(sky_map)
-        
-        # Resample to desired nside if needed
-        if map_nside != nside:
-            sky_map = hp.ud_grade(sky_map, nside)
-        
-        sky_maps.append(sky_map)
-    
-    # Stack into array: (n_freq, n_pixels)
-    sky_maps = np.array(sky_maps)
-    
-    # 3. Add the Sun to the sky model
+    # 3. Add the Sun to the sky model (Time dependent)
     sky_maps_sun = add_sun_to_sky_model(sky_maps, frequencies, time_obs, sky_coords_icrs, nside=nside)
     
     # Return the augmented map and coordinates
@@ -448,7 +455,7 @@ def plot_uv_coverage(uvw, highlight_indices=None, freq_idx=0, save_path=None):
 
 
 def generate_visibilities(antenna_mapping, frequencies, time_obs=None, n_sky_pixels=None, 
-                         custom_baselines=None, custom_baseline_pairs=None):
+                         custom_baselines=None, custom_baseline_pairs=None, base_sky_maps=None):
     """
     Generate simulated visibilities for the CASM array using Van Cittert-Zernike formalism.
     
@@ -466,6 +473,8 @@ def generate_visibilities(antenna_mapping, frequencies, time_obs=None, n_sky_pix
         Pre-calculated or subset of baselines (meters)
     custom_baseline_pairs : array (optional)
         Corresponding antenna pairs
+    base_sky_maps : array (optional)
+        Pre-calculated base sky maps
     
     Returns:
     --------
@@ -495,7 +504,7 @@ def generate_visibilities(antenna_mapping, frequencies, time_obs=None, n_sky_pix
     # Get sky model
     print(f"Generating sky model for {n_freq} frequencies...")
     # Use nside=64 for ~49,000 pixels (resolution ~1 deg)
-    sky_maps, pixel_directions, pixel_altaz = get_sky_model(frequencies, time_obs=time_obs, nside=64)
+    sky_maps, pixel_directions, pixel_altaz = get_sky_model(frequencies, time_obs=time_obs, nside=64, base_sky_maps=base_sky_maps)
     n_pixels = sky_maps.shape[1]
     
     # Calculate direction cosines (l, m, n)
@@ -584,6 +593,9 @@ def generate_visibilities(antenna_mapping, frequencies, time_obs=None, n_sky_pix
         if f_idx % 10 == 0:
             print(f"   Processed frequency channel {f_idx}/{n_freq}")
             
+    # Calculate visible source positions
+    src_names, src_az, src_alt = get_all_sources_altaz(time_obs)
+            
     result = {
         'visibilities': visibilities,
         'baselines': baselines_meters,
@@ -595,6 +607,9 @@ def generate_visibilities(antenna_mapping, frequencies, time_obs=None, n_sky_pix
         'n_baselines': n_baselines,
         'n_freq': n_freq,
         'pixel_altaz': pixel_altaz,
+        'source_names': src_names,
+        'source_az': src_az,
+        'source_alt': src_alt
     }
     
     return result
@@ -628,6 +643,53 @@ def plot_antenna_layout(antenna_mapping, save_path=None):
         print(f"Saved antenna layout plot to {save_path}")
     else:
         plt.show()
+
+
+
+def get_bright_sources_coords(time_obs):
+    """
+    Get coordinates of bright sources including the Sun.
+    """
+    bright_sources = {
+        'Cas A': SkyCoord(ra=350.85*u.deg, dec=58.81*u.deg, frame='icrs'),
+        'Cyg A': SkyCoord(ra=299.87*u.deg, dec=40.73*u.deg, frame='icrs'),
+        'Tau A': SkyCoord(ra=83.63*u.deg, dec=22.01*u.deg, frame='icrs')
+    }
+    # Add position of the sun
+    sun_coord = get_sun(time_obs)
+    bright_sources['Sun'] = sun_coord
+    return bright_sources
+
+def get_all_sources_altaz(time_obs):
+    """
+    Get Alt-Az coordinates of all bright sources.
+    If a source is below the horizon, Alt and Az are set to 0.
+    Returns: source_names (list), source_az (list), source_alt (list)
+    """
+    location = EarthLocation(
+        lat=OVRO_LAT*u.deg,
+        lon=OVRO_LON*u.deg,
+        height=OVRO_ELEV*u.m
+    )
+    
+    sources = get_bright_sources_coords(time_obs)
+    
+    names = []
+    az_vals = []
+    alt_vals = []
+    
+    for name, coord in sources.items():
+        altaz = coord.transform_to(AltAz(obstime=time_obs, location=location))
+        names.append(name)
+        if altaz.alt.deg > 0:
+            az_vals.append(altaz.az.deg)
+            alt_vals.append(altaz.alt.deg)
+        else:
+            # User requested 0 if below horizon
+            az_vals.append(0.0)
+            alt_vals.append(0.0)
+            
+    return np.array(names), np.array(az_vals), np.array(alt_vals)
 
 
 def plot_sky_map_with_beam(sky_maps, pixel_altaz, frequencies, time_obs, output_dir='skymaps'):
@@ -671,15 +733,8 @@ def plot_sky_map_with_beam(sky_maps, pixel_altaz, frequencies, time_obs, output_
         height=OVRO_ELEV*u.m
     )
     
-    # Define bright sources
-    bright_sources = {
-        'Cas A': SkyCoord(ra=350.85*u.deg, dec=58.81*u.deg, frame='icrs'),
-        'Cyg A': SkyCoord(ra=299.87*u.deg, dec=40.73*u.deg, frame='icrs'),
-        'Tau A': SkyCoord(ra=83.63*u.deg, dec=22.01*u.deg, frame='icrs')
-    }
-    # Add position of the sun
-    sun_coord = get_sun(time_obs)
-    bright_sources['Sun'] = sun_coord
+    # Get bright sources
+    bright_sources = get_bright_sources_coords(time_obs)
     
     # Get time string for filenames
     pst = timezone('America/Los_Angeles')
@@ -788,6 +843,125 @@ def plot_sky_map_with_beam(sky_maps, pixel_altaz, frequencies, time_obs, output_
     print(f"   Generated {len(frequencies) * 2} sky map images in {output_dir}/")
 
 
+def run_simulation_snapshot(time_obs, antenna_mapping, frequencies, args, output_base_dir=None, base_sky_maps=None):
+    """
+    Run a single simulation snapshot for a given time.
+    """
+    # Display time in PST
+    pst = timezone('America/Los_Angeles')
+    time_pst = time_obs.to_datetime(timezone=pst)
+    time_str_file = time_pst.strftime('%Y%m%d_%H%M%S')
+    time_str_log = time_pst.strftime('%Y-%m-%d %H:%M:%S %Z')
+    
+    print(f"\n--- Processing Snapshot: {time_str_log} ---")
+    
+    # Determine output directories
+    if output_base_dir:
+        skymaps_dir = os.path.join(output_base_dir, 'skymaps')
+        vis_dir = os.path.join(output_base_dir, 'visibilities')
+        os.makedirs(skymaps_dir, exist_ok=True)
+        os.makedirs(vis_dir, exist_ok=True)
+        vis_filename = os.path.join(vis_dir, f'casm_visibilities_{time_str_file}.npz')
+    else:
+        skymaps_dir = 'skymaps'
+        vis_filename = 'casm_visibilities_test.npz' if args.test_baselines else 'casm_visibilities.npz'
+
+    # Step 3: Visual Sky Model (400 MHz)
+    # Only generating visualization when requested (implicit usually, but good to have)
+    print("   Generating sky model for visualization (400 MHz)...")
+    plot_freqs = np.array([400.0])
+    sky_maps_plot, pixel_directions_plot, pixel_altaz_plot = get_sky_model(plot_freqs, time_obs=time_obs, nside=64)
+    
+    print("   Visualizing sky maps...")
+    plot_sky_map_with_beam(sky_maps_plot, pixel_altaz_plot, plot_freqs, time_obs, output_dir=skymaps_dir)
+    
+    # Step 5: Visibility Generation
+    if args.compvis:
+        print("   Generating visibilities...")
+        
+        calc_baselines = None
+        calc_pairs = None
+        positions = antenna_mapping['positions']
+        
+        # Test Baselines Logic
+        if args.test_baselines:
+            # Calculate all baselines first
+            all_baselines, all_pairs = calculate_baselines(positions)
+            
+            # Target pairs: [0,0] (Auto), [0,5] (Max EW), [0,24] (Max NS)
+            target_pairs = [[0, 0], [0, 5], [0, 24]]
+            test_indices = []
+            
+            for idx, pair in enumerate(all_pairs):
+                p_list = sorted(list(pair))
+                if p_list in target_pairs:
+                     test_indices.append(idx)
+            
+            # Select subset
+            calc_baselines = all_baselines[test_indices]
+            calc_pairs = all_pairs[test_indices]
+            
+            # Only plot UV coverage on first run or if single run (handled by caller generally, but OK here)
+            if not output_base_dir: 
+                print("   Generating UV coverage plot...")
+                uvw_all = calculate_uvw(all_baselines, frequencies)
+                plot_uv_coverage(uvw_all, highlight_indices=test_indices, freq_idx=len(frequencies)//2, save_path='casm_uv_coverage_test.png')
+
+        vis_data = generate_visibilities(
+            antenna_mapping,
+            frequencies,
+            time_obs=time_obs,
+            n_sky_pixels=1000,
+            custom_baselines=calc_baselines,
+            custom_baseline_pairs=calc_pairs,
+            base_sky_maps=base_sky_maps
+        )
+        
+        # Save results
+        print(f"   Saving results to {vis_filename}...")
+        np.savez_compressed(
+            vis_filename,
+            visibilities=vis_data['visibilities'],
+            baselines=vis_data['baselines'],
+            uvw=vis_data['uvw'],
+            baseline_pairs=vis_data['baseline_pairs'],
+            frequencies=vis_data['frequencies'],
+            antenna_positions=positions,
+            pixel_altaz=vis_data['pixel_altaz'],
+            time_obs=time_obs.iso,
+            source_names=vis_data['source_names'],
+            source_az=vis_data['source_az'],
+            source_alt=vis_data['source_alt'],
+            **antenna_mapping
+        )
+
+
+def run_time_series_simulation(start_time, duration_hours, timestep_minutes, antenna_mapping, frequencies, args):
+    """
+    Run a time-series simulation.
+    """
+    end_time = start_time + timedelta(hours=duration_hours)
+    
+    # Create results directory
+    pst = timezone('America/Los_Angeles')
+    start_str = start_time.to_datetime(timezone=pst).strftime('%Y%m%d_%H%M')
+    end_str = end_time.to_datetime(timezone=pst).strftime('%Y%m%d_%H%M')
+    
+    results_dir = f"results_{start_str}_to_{end_str}"
+    os.makedirs(results_dir, exist_ok=True)
+    print(f"\nStarting Time Series Simulation: {duration_hours} hours, {timestep_minutes} min steps")
+    print(f"Output Directory: {results_dir}")
+    
+    # Pre-compute base sky maps (GSM)
+    base_sky_maps = generate_base_sky_model(frequencies, nside=64)
+    
+    current_time = start_time
+    while current_time <= end_time:
+        run_simulation_snapshot(current_time, antenna_mapping, frequencies, args, 
+                              output_base_dir=results_dir, base_sky_maps=base_sky_maps)
+        current_time = current_time + timedelta(minutes=timestep_minutes)
+
+
 def main():
     """Main function to generate CASM visibilities."""
     parser = argparse.ArgumentParser(description='CASM Visibility Simulation')
@@ -801,176 +975,70 @@ def main():
     parser.add_argument('--test-baselines', action='store_true',
                        help='Run in test mode: select max NS and EW baselines only (default: False)')
     
+    # Time Series Arguments
+    parser.add_argument('--time-series', action='store_true',
+                       help='Run a time-series simulation (requires --test-baselines)')
+    parser.add_argument('--duration', type=float, default=24.0,
+                       help='Duration of time series in hours (default: 24.0)')
+    parser.add_argument('--timestep', type=float, default=15.0,
+                       help='Time step in minutes (default: 15.0)')
+
     args = parser.parse_args()
     
     print("=" * 60)
     print("CASM Visibility Simulation")
     print("=" * 60)
     
-    # Set observation time
+    # Validate Time Series Constraint
+    if args.time_series and not args.test_baselines:
+        print("ERROR: --time-series mode requires --test-baselines to be enabled.")
+        return
+
+    # Set observation time (Start time for time series)
     pst = timezone('America/Los_Angeles')
-    
     if args.time:
-        # 1. Try ISO format (Astropy Time)
+        # (Parsing logic handled same as before)
         try:
             time_obs = Time(args.time)
             print(f"   Parsed explicit time: {args.time}")
         except ValueError:
-            # 2. Try HH:MM format (PST Today)
             try:
-                # Get current date in PST
                 now_pst = datetime.now(pst)
-                
-                # Parse input time string
                 parts = list(map(int, args.time.split(':')))
                 if len(parts) == 2:
                     hour, minute = parts
                     second = 0
                 elif len(parts) == 3:
-                    hour, minute, second = parts
+                     hour, minute, second = parts
                 else:
                     raise ValueError
-                
-                # Create observation datetime
                 obs_dt = now_pst.replace(hour=hour, minute=minute, second=second, microsecond=0)
                 time_obs = Time(obs_dt)
                 print(f"   Parsed local time (PST): {args.time} -> {obs_dt}")
-                
             except ValueError:
                 print(f"ERROR: Invalid time format '{args.time}'.")
-                print("       Use ISO-8601 (YYYY-MM-DDTHH:MM:SS) OR HH:MM (24-hr PST today).")
                 return
     else:
         time_obs = Time.now()
-    
-    # Display time in PST
-    pst = timezone('America/Los_Angeles')
-    time_pst = time_obs.to_datetime(timezone=pst)
-    time_str = time_pst.strftime('%Y-%m-%d %H:%M:%S %Z')
-    print(f"\nObservation Time: {time_obs.iso} UTC")
-    print(f"Observation Time: {time_str} PST")
     
     # Step 1: Generate antenna position mapping
     print("\n1. Generating antenna position mapping...")
     antenna_mapping = generate_antenna_mapping()
     positions = antenna_mapping['positions']
     print(f"   Generated {antenna_mapping['n_antennas']} antenna positions")
-    print(f"   Array dimensions: {ARRAY_NS_LENGTH}m (N-S) x {ARRAY_EW_LENGTH}m (E-W)")
-    print(f"   Position range: East [{positions[:, 0].min():.2f}, {positions[:, 0].max():.2f}] m")
-    print(f"                    North [{positions[:, 1].min():.2f}, {positions[:, 1].max():.2f}] m")
-    print(f"                    Up [{positions[:, 2].min():.2f}, {positions[:, 2].max():.2f}] m")
     
-    # Plot antenna layout
-    plot_antenna_layout(antenna_mapping, save_path='casm_antenna_layout.png')
+    if not args.time_series:
+        plot_antenna_layout(antenna_mapping, save_path='casm_antenna_layout.png')
     
     # Step 2: Define frequency range
     print("\n2. Setting up frequency range...")
     n_channels = args.n_channels
     frequencies = np.linspace(FREQ_MIN, FREQ_MAX, n_channels)
-    print(f"   Frequency range: {FREQ_MIN:.1f} - {FREQ_MAX:.1f} MHz")
-    print(f"   Number of channels: {n_channels}")
-    print(f"   Channel width: {(FREQ_MAX - FREQ_MIN) / n_channels:.2f} MHz")
     
-    # Step 3: Generate sky model for visualization (400 MHz)...
-    print("\n3. Generating sky model for visualization (400 MHz)...")
-    
-    # Generate exact 400 MHz model for visualization
-    plot_freqs = np.array([400.0])
-    sky_maps_plot, pixel_directions_plot, pixel_altaz_plot = get_sky_model(plot_freqs, time_obs=time_obs, nside=64)
-    
-    # Visualize sky maps with and without mask
-    print("\n4. Visualizing sky maps (Masked and Unmasked)...")
-    plot_sky_map_with_beam(sky_maps_plot, pixel_altaz_plot, plot_freqs, time_obs, output_dir='skymaps')
-    
-    # Step 5: Generate visibilities (if requested)
-    if args.compvis:
-        print("\n5. Generating visibilities...")
-        
-        # Prepare inputs
-        calc_baselines = None
-        calc_pairs = None
-        
-        # Test Baselines Mode
-        if args.test_baselines:
-            print("\n   [TEST MODE] Selecting specific baselines...")
-            # Calculate all baselines first
-            all_baselines, all_pairs = calculate_baselines(positions)
-            
-            # Identify indices
-            # Max EW: Ant 0 (0,0) to Ant 5 (0,5) -> Pair [0, 5]
-            # Max NS: Ant 0 (0,0) to Ant 24 (4,0) -> Pair [0, 24]
-            test_indices = []
-            
-            # Ant 0 index = 0
-            # Ant EW Max index = N_COLS - 1 = 5
-            # Ant NS Max index = (N_ROWS - 1) * N_COLS = 24
-            target_pairs = [[0, 5], [0, 24]]
-            print(f"   Looking for pairs: {target_pairs} (indices)")
-            
-            for idx, pair in enumerate(all_pairs):
-                p_list = sorted(list(pair))
-                if p_list == target_pairs[0] or p_list == target_pairs[1]:
-                     test_indices.append(idx)
-            
-            if len(test_indices) != 2:
-                print(f"   WARNING: Could not find all test baselines. Found indices: {test_indices}")
-            else:
-                print(f"   Found test baselines at indices: {test_indices}")
-            
-            # Select subset
-            calc_baselines = all_baselines[test_indices]
-            calc_pairs = all_pairs[test_indices]
-            
-            # Plot UVW Coverage (Contextual)
-            print("   Generating UV coverage plot...")
-            # Calculate UVW for all baselines for context
-            uvw_all = calculate_uvw(all_baselines, frequencies)
-            plot_uv_coverage(uvw_all, highlight_indices=test_indices, freq_idx=len(frequencies)//2, save_path='casm_uv_coverage_test.png')
-            
-        else:
-            print("   Using all baselines.")
-
-        vis_data = generate_visibilities(
-            antenna_mapping,
-            frequencies,
-            time_obs=time_obs,
-            n_sky_pixels=1000,
-            custom_baselines=calc_baselines,
-            custom_baseline_pairs=calc_pairs
-        )
-        
-        print(f"\n   Generated visibilities:")
-        print(f"   - Shape: {vis_data['visibilities'].shape}")
-        print(f"   - Number of baselines: {vis_data['n_baselines']}")
-        print(f"   - Number of frequencies: {vis_data['n_freq']}")
-        print(f"   - Polarizations: {N_POL}x{N_POL}")
-        
-        # Save results
-        filename = 'casm_visibilities_test.npz' if args.test_baselines else 'casm_visibilities.npz'
-        print(f"\n6. Saving results to {filename}...")
-        np.savez_compressed(
-            filename,
-            visibilities=vis_data['visibilities'],
-            baselines=vis_data['baselines'],
-            uvw=vis_data['uvw'],
-            baseline_pairs=vis_data['baseline_pairs'],
-            frequencies=vis_data['frequencies'],
-            antenna_positions=positions,
-            pixel_altaz=vis_data['pixel_altaz'],
-            time_obs=time_obs.iso,
-            **antenna_mapping
-        )
-        print(f"   Saved to {filename}")
-        
-        # Print summary statistics
-        print("\n7. Visibility Statistics:")
-        vis_abs = np.abs(vis_data['visibilities'])
-        print(f"   Mean |V|: {np.mean(vis_abs):.6e}")
-        print(f"   Std |V|: {np.std(vis_abs):.6e}")
-        print(f"   Max |V|: {np.max(vis_abs):.6e}")
-        print(f"   Min |V|: {np.min(vis_abs):.6e}")
+    if args.time_series:
+        run_time_series_simulation(time_obs, args.duration, args.timestep, antenna_mapping, frequencies, args)
     else:
-        print("\n5. Skipping visibility computation (use --compvis to enable)")
+        run_simulation_snapshot(time_obs, antenna_mapping, frequencies, args)
     
     print("\n" + "=" * 60)
     print("Simulation complete!")

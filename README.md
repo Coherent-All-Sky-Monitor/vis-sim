@@ -1,14 +1,14 @@
 # CASM Visibility Simulation
 
-This repository contains tools for simulating visibilities for the CASM (Coherent All Sky Monitor) phased array radio experiment.
+This repository contains tools for simulating visibilities for the CASM (Coherent All Sky Monitor).
 
 ## Code Overview
 
-The main script `main.py` is a comprehensive simulation pipeline that:
-1.  **Generates Array Layout**: Creates the antenna array configuration, 5 x 6 (NS x EW) grid over a 10m x 6m area by default.
-2.  **Models the Sky**: Uses `pygdsm` to generate sky maps and also adds a model for the Sun.
-3.  **Visualizes the Sky**: Produces sky maps with and without the primary beam pattern opacity mask.
-4.  **Computes Visibilities**: Calculates noiseless visibilities using the Van Cittert-Zernike formalism ($V = \int I \cdot A \cdot e^{-2\pi i (ul+vm+wn)} d\Omega$).
+The script `main.py` can:
+1.  **Generate Antenna Layout**: Creates the antenna array configuration, 5 x 6 (NS x EW) grid over a 10m x 6m area by default.
+2.  **Model the Sky**: Uses `pygdsm` to generate sky maps and also adds a model for the Sun.
+3.  **Visualize the Sky**: Produces sky maps with and without the primary beam pattern opacity mask.
+4.  **Compute Visibilities**: Calculates visibilities using the Van Cittert-Zernike formalism ($V = \int I \cdot A \cdot e^{-2\pi i (ul+vm+wn)} d\Omega$).
 
 ## Usage 
 
@@ -32,7 +32,7 @@ python main.py --compvis --n-channels 100
     *   `casm_visibilities.npz`: Complete visibility data.
 
 ### 3. Test Baselines Mode
-Useful for debugging or analyzing specific baselines. This mode restricts calculation to the maximum North-South and East-West baselines only.
+Useful for debugging or analyzing specific baselines. This mode restricts calculation to the maximum North-South and East-West baselines only. The antenna pairs are hardcoded (see `target_pairs` in `main.py`).
 
 ```bash
 python main.py --compvis --test-baselines --n-channels 100
