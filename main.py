@@ -1025,7 +1025,7 @@ def main():
     parser.add_argument('--timestep', type=float, default=15.0,
                        help='Time step in minutes (default: 15.0)')
 
-    parser.add_argument('--custom-baseline', nargs=2, type=float, metavar=('NS', 'EW'),
+    parser.add_argument('--custom-baseline', nargs=3, type=float, metavar=('NS', 'EW', 'Z'),
                        help='Run in custom single-baseline mode with given NS (meters) and EW (meters) lengths. Ignores grid.')
 
     args = parser.parse_args()
