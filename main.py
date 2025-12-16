@@ -27,7 +27,7 @@ N_POL = 2    # Two polarizations per antenna
 ARRAY_NS_LENGTH = 10.0  # meters (North-South)
 ARRAY_EW_LENGTH = 6.0   # meters (East-West)
 FREQ_MIN = 375.0  # MHz
-FREQ_MAX = 468.0  # MHz (375 + 93 MHz bandwidth)
+FREQ_MAX = 500.0  # MHz (375 + 93 MHz bandwidth)
 FREQ_CENTER = (FREQ_MIN + FREQ_MAX) / 2.0  # MHz
 
 C_LIGHT = 299792458.0    # Speed of light in m/s
@@ -242,7 +242,30 @@ def add_sun_to_sky_model(sky_maps, frequencies, time_obs, sky_coords_icrs, nside
 def generate_base_sky_model(frequencies, nside=64):
     """
     Generate the time-independent component of the sky model (GSM) in Galactic coordinates.
+    Includes persistent caching to speed up repeated runs.
     """
+    cache_dir = "gsm_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Create a unique filename based on parameters
+    f_min = frequencies[0]
+    f_max = frequencies[-1]
+    n_ch = len(frequencies)
+    cache_filename = f"gsm_nch{n_ch}_fmin{f_min:.2f}_fmax{f_max:.2f}_nside{nside}.npy"
+    cache_path = os.path.join(cache_dir, cache_filename)
+    
+    # Check cache
+    if os.path.exists(cache_path):
+        print(f"   Loading cached GSM model from {cache_path}...")
+        try:
+            sky_maps = np.load(cache_path)
+            if sky_maps.shape[0] == n_ch:
+                return sky_maps
+            else:
+                print("   Cache shape mismatch, regenerating...")
+        except Exception as e:
+            print(f"   Error loading cache: {e}. Regenerating...")
+            
     print(f"   Pre-computing GSM background for {len(frequencies)} channels...")
     gsm = pygdsm.GlobalSkyModel16(freq_unit='MHz', data_unit='TCMB')
     sky_maps = []
@@ -254,7 +277,13 @@ def generate_base_sky_model(frequencies, nside=64):
             sky_map = hp.ud_grade(sky_map, nside)
         sky_maps.append(sky_map)
         
-    return np.array(sky_maps)
+    sky_maps_arr = np.array(sky_maps)
+    
+    # Save to cache
+    print(f"   Saving GSM model to cache: {cache_path}")
+    np.save(cache_path, sky_maps_arr)
+        
+    return sky_maps_arr
 
 
 def get_sky_model(frequencies, time_obs=None, nside=64, base_sky_maps=None):
@@ -843,7 +872,7 @@ def plot_sky_map_with_beam(sky_maps, pixel_altaz, frequencies, time_obs, output_
     print(f"   Generated {len(frequencies) * 2} sky map images in {output_dir}/")
 
 
-def run_simulation_snapshot(time_obs, antenna_mapping, frequencies, args, output_base_dir=None, base_sky_maps=None):
+def run_simulation_snapshot(time_obs, antenna_mapping, frequencies, args, output_base_dir=None, base_sky_maps=None, generate_skymaps=True):
     """
     Run a single simulation snapshot for a given time.
     """
@@ -868,12 +897,13 @@ def run_simulation_snapshot(time_obs, antenna_mapping, frequencies, args, output
 
     # Step 3: Visual Sky Model (400 MHz)
     # Only generating visualization when requested (implicit usually, but good to have)
-    print("   Generating sky model for visualization (400 MHz)...")
-    plot_freqs = np.array([400.0])
-    sky_maps_plot, pixel_directions_plot, pixel_altaz_plot = get_sky_model(plot_freqs, time_obs=time_obs, nside=64)
-    
-    print("   Visualizing sky maps...")
-    plot_sky_map_with_beam(sky_maps_plot, pixel_altaz_plot, plot_freqs, time_obs, output_dir=skymaps_dir)
+    if generate_skymaps:
+        print("   Generating sky model for visualization (400 MHz)...")
+        plot_freqs = np.array([400.0])
+        sky_maps_plot, pixel_directions_plot, pixel_altaz_plot = get_sky_model(plot_freqs, time_obs=time_obs, nside=64)
+        
+        print("   Visualizing sky maps...")
+        plot_sky_map_with_beam(sky_maps_plot, pixel_altaz_plot, plot_freqs, time_obs, output_dir=skymaps_dir)
     
     # Step 5: Visibility Generation
     if args.compvis:
@@ -884,7 +914,19 @@ def run_simulation_snapshot(time_obs, antenna_mapping, frequencies, args, output
         positions = antenna_mapping['positions']
         
         # Test Baselines Logic
-        if args.test_baselines:
+        if args.custom_baseline:
+            # For custom baseline mode (2 antennas), we just want the single cross-correlation
+            # Positions are [Ant0, Ant1]
+            # Baseline = Ant1 - Ant0
+            # Indices [0, 1]
+            
+            # Manually define the single baseline
+            # (East, North, Up)
+            baseline_vec = positions[1] - positions[0]
+            calc_baselines = np.array([baseline_vec])
+            calc_pairs = np.array([[0, 1]])
+
+        elif args.test_baselines:
             # Calculate all baselines first
             all_baselines, all_pairs = calculate_baselines(positions)
             
@@ -958,7 +1000,7 @@ def run_time_series_simulation(start_time, duration_hours, timestep_minutes, ant
     current_time = start_time
     while current_time <= end_time:
         run_simulation_snapshot(current_time, antenna_mapping, frequencies, args, 
-                              output_base_dir=results_dir, base_sky_maps=base_sky_maps)
+                              output_base_dir=results_dir, base_sky_maps=base_sky_maps, generate_skymaps=False)
         current_time = current_time + timedelta(minutes=timestep_minutes)
 
 
@@ -982,6 +1024,9 @@ def main():
                        help='Duration of time series in hours (default: 24.0)')
     parser.add_argument('--timestep', type=float, default=15.0,
                        help='Time step in minutes (default: 15.0)')
+
+    parser.add_argument('--custom-baseline', nargs=2, type=float, metavar=('NS', 'EW'),
+                       help='Run in custom single-baseline mode with given NS (meters) and EW (meters) lengths. Ignores grid.')
 
     args = parser.parse_args()
     
@@ -1022,10 +1067,31 @@ def main():
         time_obs = Time.now()
     
     # Step 1: Generate antenna position mapping
-    print("\n1. Generating antenna position mapping...")
-    antenna_mapping = generate_antenna_mapping()
-    positions = antenna_mapping['positions']
-    print(f"   Generated {antenna_mapping['n_antennas']} antenna positions")
+    if args.custom_baseline:
+        print("\n1. Generating Custom Single Baseline configuration...")
+        ns_dist, ew_dist = args.custom_baseline
+        # Create a simple 2-element array
+        # Center at 0,0 for symmetry
+        positions = np.array([
+            [-ew_dist/2.0, -ns_dist/2.0, 0.0],
+            [ew_dist/2.0, ns_dist/2.0, 0.0]
+        ])
+        antenna_mapping = {
+            'positions': positions,
+            'n_antennas': 2,
+            'n_pol': N_POL,
+            'array_shape': (1, 2), # Dummy
+            'array_dimensions': (ns_dist, ew_dist),
+            'antenna_ids': np.array([0, 1]),
+            'row_indices': np.array([0, 0]),
+            'col_indices': np.array([0, 1]),
+        }
+        print(f"   Created custom baseline: NS={ns_dist}m, EW={ew_dist}m")
+    else:
+        print("\n1. Generating antenna position mapping...")
+        antenna_mapping = generate_antenna_mapping()
+        positions = antenna_mapping['positions']
+        print(f"   Generated {antenna_mapping['n_antennas']} antenna positions")
     
     if not args.time_series:
         plot_antenna_layout(antenna_mapping, save_path='casm_antenna_layout.png')

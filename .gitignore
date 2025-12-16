@@ -2,3 +2,5 @@ context/
 *.png
 skymaps/
 *.npz
+results_*/
+gsm_cache/
