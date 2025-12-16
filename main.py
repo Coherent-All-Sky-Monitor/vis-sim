@@ -1069,12 +1069,12 @@ def main():
     # Step 1: Generate antenna position mapping
     if args.custom_baseline:
         print("\n1. Generating Custom Single Baseline configuration...")
-        ns_dist, ew_dist = args.custom_baseline
+        ns_dist, ew_dist, z_dist = args.custom_baseline
         # Create a simple 2-element array
         # Center at 0,0 for symmetry
         positions = np.array([
-            [-ew_dist/2.0, -ns_dist/2.0, 0.0],
-            [ew_dist/2.0, ns_dist/2.0, 0.0]
+            [-ew_dist/2.0, -ns_dist/2.0, -z_dist/2.0],
+            [ew_dist/2.0, ns_dist/2.0, z_dist/2.0]
         ])
         antenna_mapping = {
             'positions': positions,
