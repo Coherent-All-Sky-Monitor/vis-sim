@@ -1054,6 +1054,8 @@ def main():
 
     parser.add_argument('--custom-baseline', nargs=3, type=float, metavar=('NS', 'EW', 'Z'),
                        help='Run in custom single-baseline mode with given NS (meters) and EW (meters) lengths. Ignores grid.')
+    parser.add_argument('--layout', type=str, default='casm-13.csv',
+                        help="Path to antenna layout CSV file (default: 'casm-13.csv')")
 
     args = parser.parse_args()
     
@@ -1115,8 +1117,8 @@ def main():
         }
         print(f"   Created custom baseline: NS={ns_dist}m, EW={ew_dist}m")
     else:
-        print("\n1. Generating antenna position mapping...")
-        antenna_mapping = generate_antenna_mapping()
+        print(f"\n1. Generating antenna position mapping from {args.layout}...")
+        antenna_mapping = generate_antenna_mapping(csv_path=args.layout)
         positions = antenna_mapping['positions']
         print(f"   Generated {antenna_mapping['n_antennas']} antenna positions")
     
