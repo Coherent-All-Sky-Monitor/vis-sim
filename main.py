@@ -34,9 +34,9 @@ C_LIGHT = 299792458.0    # Speed of light in m/s
 K_BOLTZMANN = 1.380649e-23 # Boltzmann constant in J/K
 
 # OVRO location (approximate coordinates for Owens Valley Radio Observatory)
-OVRO_LAT = 37.2339  # degrees
-OVRO_LON = -118.2817  # degrees
-OVRO_ELEV = 1222.0  # meters
+OVRO_LAT = 37.234165  # degrees
+OVRO_LON = -118.283407  # degrees
+OVRO_ELEV = 1207.0  # meters
 
 # Primary beam solid angle (near zenith)
 PRIMARY_BEAM_SOLID_ANGLE = 7500.0  # square degrees
