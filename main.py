@@ -48,55 +48,82 @@ SUN_DIAMETER_DEG = 1.2       # degrees (Approximation for size at 400 MHz)
 SUN_SIGMA_DEG = SUN_DIAMETER_DEG / 2.355  # FWHM to Gaussian sigma: sigma = FWHM / (2*sqrt(2*ln(2)))
 # -----------------------------
 
-
-def generate_antenna_positions():
+def generate_antenna_positions(csv_path):
     """
-    Generate spatial positions for the 43x6 grid of antennas.
-    Returns positions in local ENU (East-North-Up) coordinates in meters.
+    Reads antenna positions from a CSV file and converts them to a numpy array.
+    
+    Expected CSV format:
+    antenna,x,y or antenna,x,y,z
+    
+    Parameters:
+    -----------
+    csv_path : str
+        Path to the CSV file containing antenna positions.
+        
+    Returns:
+    --------
+    positions : array
+        Numpy array of shape (N_antennas, 3) representing ENU coordinates in meters.
+        (East, North, Up). Z (Up) defaults to 0 if not provided.
     """
-    # Create grid indices
-    row_indices = np.arange(N_ROWS)  # 0 to N_ROWS-1
-    col_indices = np.arange(N_COLS)  # 0 to N_COLS-1
-    
-    # Calculate spacing
-    ns_spacing = ARRAY_NS_LENGTH / (N_ROWS - 1) if N_ROWS > 1 else 0
-    ew_spacing = ARRAY_EW_LENGTH / (N_COLS - 1) if N_COLS > 1 else 0
-    
-    # Generate positions in local coordinates (East, North, Up)
-    # East is x, North is y, Up is z
-    positions = np.zeros((N_ANTENNAS, 3))
-    
-    idx = 0
-    for row in row_indices:
-        for col in col_indices:
-            # Position relative to array center
-            # East (x): col * spacing - center_offset
-            # North (y): row * spacing - center_offset
-            # Up (z): 0.24 m above ground screen
-            positions[idx, 0] = col * ew_spacing - ARRAY_EW_LENGTH / 2.0  # East
-            positions[idx, 1] = row * ns_spacing - ARRAY_NS_LENGTH / 2.0  # North
-            positions[idx, 2] = 0.24  # Up (24 cm above ground screen)
-            idx += 1
-    
-    return positions
+    try:
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"Antenna position CSV not found: {csv_path}")
+
+        # Load the CSV file
+        data = np.genfromtxt(csv_path, delimiter=',', names=True, dtype=None, encoding=None)
+        
+        # Check if the required fields are present
+        if 'antenna' not in data.dtype.names or 'x' not in data.dtype.names or 'y' not in data.dtype.names:
+            raise ValueError("CSV must contain 'antenna', 'x', and 'y' columns.")
+            
+        # Sort by antenna index to ensure correct order
+        data = np.sort(data, order='antenna')
+        
+        # Extract coordinates
+        x = data['x'].astype(float)
+        y = data['y'].astype(float)
+        
+        # Handle optional z column
+        if 'z' in data.dtype.names:
+            z = data['z'].astype(float)
+        else:
+            # Assume z = 0 (planar array) if not provided
+            z = np.zeros_like(x)
+        
+        # Stack into (N, 3) array
+        positions = np.column_stack((x, y, z))
+        
+        return positions
+
+    except Exception as e:
+        print(f"Error reading antenna positions from {csv_path}: {e}")
+        # Return a fallback or raise
+        raise e
 
 
-def generate_antenna_mapping():
+def generate_antenna_mapping(csv_path='casm-13.csv'):
     """
     Create a mapping dictionary that stores antenna information.
     Returns a dictionary with antenna positions and metadata.
     """
-    positions = generate_antenna_positions()
+    positions = generate_antenna_positions(csv_path)
+    
+    # Update N_ANTENNAS based on loaded positions
+    n_loaded = len(positions)
+    # Note: Global N_ANTENNAS, N_ROWS, N_COLS might mismatch the CSV.
+    # ideally we should update them or rely on the loaded data.
+    # For now, we update the dictionary values.
     
     mapping = {
-        'positions': positions,  # Shape: (258, 3) in ENU coordinates (meters)
-        'n_antennas': N_ANTENNAS,
+        'positions': positions,  # Shape: (N, 3) in ENU coordinates (meters)
+        'n_antennas': n_loaded,
         'n_pol': N_POL,
-        'array_shape': (N_ROWS, N_COLS),
-        'array_dimensions': (ARRAY_NS_LENGTH, ARRAY_EW_LENGTH),
-        'antenna_ids': np.arange(N_ANTENNAS),
-        'row_indices': np.repeat(np.arange(N_ROWS), N_COLS),
-        'col_indices': np.tile(np.arange(N_COLS), N_ROWS),
+        'array_shape': (1, n_loaded), # Generic linear/unstructured shape if not grid
+        'array_dimensions': (ARRAY_NS_LENGTH, ARRAY_EW_LENGTH), # Keep existing bounds?
+        'antenna_ids': np.arange(n_loaded),
+        'row_indices': np.zeros(n_loaded, dtype=int), # Dummy indices
+        'col_indices': np.arange(n_loaded, dtype=int),
     }
     
     return mapping
