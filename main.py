@@ -1063,10 +1063,6 @@ def main():
     print("CASM Visibility Simulation")
     print("=" * 60)
     
-    # Validate Time Series Constraint
-    if args.time_series and not args.test_baselines:
-        print("ERROR: --time-series mode requires --test-baselines to be enabled.")
-        return
 
     # Set observation time (Start time for time series)
     pst = timezone('America/Los_Angeles')
