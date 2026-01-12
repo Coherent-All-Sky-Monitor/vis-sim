@@ -46,6 +46,7 @@ PRIMARY_BEAM_SOLID_ANGLE = 7500.0  # square degrees
 SUN_BRIGHTNESS_TEMP = 8.0e5  # K (Approximation for Quiet Sun T_b)
 SUN_DIAMETER_DEG = 1.2       # degrees (Approximation for size at 400 MHz)
 SUN_SIGMA_DEG = SUN_DIAMETER_DEG / 2.355  # FWHM to Gaussian sigma: sigma = FWHM / (2*sqrt(2*ln(2)))
+target_ants = {4, 6, 7, 8, 9, 10, 11, 12}
 # -----------------------------
 
 def generate_antenna_positions(csv_path):
@@ -377,11 +378,14 @@ def calculate_baselines(antenna_positions):
     baselines = []
     baseline_pairs = []
     
-    for i in range(n_ant):
-        for j in range(i, n_ant):  # Include auto-correlations
-            baseline = antenna_positions[j] - antenna_positions[i]
-            baselines.append(baseline)
-            baseline_pairs.append([i, j])
+    target_list = sorted(target_ants)
+    
+    for i in target_list:
+        for j in target_list:
+            if j >= i:  # Include auto-correlations
+                baseline = antenna_positions[j] - antenna_positions[i]
+                baselines.append(baseline)
+                baseline_pairs.append([i, j])
     
     baselines = np.array(baselines)
     baseline_pairs = np.array(baseline_pairs)
@@ -1024,11 +1028,79 @@ def run_time_series_simulation(start_time, duration_hours, timestep_minutes, ant
     # Pre-compute base sky maps (GSM)
     base_sky_maps = generate_base_sky_model(frequencies, nside=64)
     
+    # Initialize lists to collect data
+    times = []
+    visibilities_list = []
+    source_names_list = []
+    source_az_list = []
+    source_alt_list = []
+    
     current_time = start_time
+    time_idx = 0
     while current_time <= end_time:
-        run_simulation_snapshot(current_time, antenna_mapping, frequencies, args, 
-                              output_base_dir=results_dir, base_sky_maps=base_sky_maps, generate_skymaps=False)
+        print(f"\n--- Processing Snapshot {time_idx+1}: {current_time.iso} ---")
+        
+        # Generate visibilities
+        calc_baselines = None
+        calc_pairs = None
+        positions = antenna_mapping['positions']
+        
+        if args.custom_baseline:
+            baseline_vec = positions[1] - positions[0]
+            calc_baselines = np.array([baseline_vec])
+            calc_pairs = np.array([[0, 1]])
+        elif args.test_baselines:
+            all_baselines, all_pairs = calculate_baselines(positions)
+            target_pairs = [[0, 0], [0, 5], [0, 24]]
+            test_indices = []
+            for idx, pair in enumerate(all_pairs):
+                p_list = sorted(list(pair))
+                if p_list in target_pairs:
+                     test_indices.append(idx)
+            calc_baselines = all_baselines[test_indices]
+            calc_pairs = all_pairs[test_indices]
+        
+        vis_data = generate_visibilities(
+            antenna_mapping,
+            frequencies,
+            time_obs=current_time,
+            n_sky_pixels=1000,
+            custom_baselines=calc_baselines,
+            custom_baseline_pairs=calc_pairs,
+            base_sky_maps=base_sky_maps
+        )
+        
+        # Collect data
+        times.append(current_time.iso)
+        visibilities_list.append(vis_data['visibilities'])
+        source_names_list.append(vis_data['source_names'])
+        source_az_list.append(vis_data['source_az'])
+        source_alt_list.append(vis_data['source_alt'])
+        
         current_time = current_time + timedelta(minutes=timestep_minutes)
+        time_idx += 1
+    
+    # Stack visibilities: (n_times, n_baselines, n_freq, 2, 2)
+    visibilities_stacked = np.stack(visibilities_list, axis=0)
+    
+    # Save single file
+    vis_filename = os.path.join(results_dir, f'casm_visibilities_{start_str}_to_{end_str}.npz')
+    print(f"\nSaving combined results to {vis_filename}...")
+    np.savez_compressed(
+        vis_filename,
+        visibilities=visibilities_stacked,
+        baselines=vis_data['baselines'],  # Same for all times
+        uvw=vis_data['uvw'],  # Same
+        baseline_pairs=vis_data['baseline_pairs'],  # Same
+        frequencies=vis_data['frequencies'],  # Same
+        antenna_positions=positions,  # Same
+        times=np.array(times),
+        source_names=np.array(source_names_list),  # (n_times, n_sources)
+        source_az=np.array(source_az_list),  # (n_times, n_sources)
+        source_alt=np.array(source_alt_list),  # (n_times, n_sources)
+        **antenna_mapping
+    )
+    print(f"Saved {len(times)} time snapshots in single file.")
 
 
 def main():

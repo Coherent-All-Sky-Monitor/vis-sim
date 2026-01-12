@@ -4,3 +4,4 @@ skymaps/
 *.npz
 results_*/
 gsm_cache/
+.ipynb_checkpoints/

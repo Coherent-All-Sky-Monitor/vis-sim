@@ -1,69 +1,52 @@
 # CASM Visibility Simulation
 
-This repository contains tools for simulating visibilities for the CASM (Coherent All Sky Monitor).
+This script simulates visibilities for the CASM (Coherent All Sky Monitor) array using the Van Cittert-Zernike formalism.
 
-## Code Overview
+## Usage
 
-The script `main.py` can:
-1.  **Generate Antenna Layout**: Creates the antenna array configuration, 5 x 6 (NS x EW) grid over a 10m x 6m area by default.
-2.  **Model the Sky**: Uses `pygdsm` to generate sky maps and also adds a model for the Sun.
-3.  **Visualize the Sky**: Produces sky maps with and without the primary beam pattern opacity mask.
-4.  **Compute Visibilities**: Calculates visibilities using the Van Cittert-Zernike formalism ($V = \int I \cdot A \cdot e^{-2\pi i (ul+vm+wn)} d\Omega$).
+### Time-Series Visibility Simulation
 
-## Usage 
-
-### 1. Skymap only (Default)
-By default, the script generates sky map images and the antenna layout but **does not** compute visibilities (which can be slow).
+Generate a time-series of visibilities for target antennas (4, 6, 7, 8, 9, 10, 11, 12) from the CASM-13 layout:
 
 ```bash
-python main.py
+python main.py --compvis --layout casm-13.csv --time-series --duration 50 --timestep 2 --n-channels 100 --time 2025-12-19T05:00:00
 ```
-*   **Outputs**:
-    *   `skymaps/`: Directory containing sky map images.
-    *   `casm_antenna_layout.png`: Plot of the array configuration.
 
-### 2. Visibility Simulation
-To compute visibilities for the specified number of frequency channels, use the `--compvis` flag and specify the number of channels using `--n-channels`.
-
-```bash
-python main.py --compvis --n-channels 100
-```
-*   **Outputs**:
-    *   `casm_visibilities.npz`: Complete visibility data.
-
-### 3. Test Baselines Mode
-Useful for debugging or analyzing specific baselines. This mode restricts calculation to the maximum North-South and East-West baselines only. The antenna pairs are hardcoded (see `target_pairs` in `main.py`).
-
-```bash
-python main.py --compvis --test-baselines --n-channels 100
-```
-*   **Features**:
-    *   Computes visibilities only for the 2 selected baselines.
-    *   Generates `casm_uv_coverage_test.png` highlighting these baselines in UV space.
-*   **Outputs**:
-    *   `casm_visibilities_test.npz`
+This creates a 50-hour simulation with 2-minute time steps, 100 frequency channels, starting at the specified UTC time.
 
 ### Command Line Arguments
 
-| Argument | Description | Default |
-| :--- | :--- | :--- |
-| `--compvis` | Enable visibility computation (default: False). | `False` |
-| `--test-baselines` | Run in test mode (max NS/EW baselines only). | `False` |
-| `--n-channels N` | Number of frequency channels to simulate. | `100` |
-| `--time "TIME"` | Observation time. Accepts "HH:MM" (PST Today) OR ISO-8601 "YYYY-MM-DD...". | `Now` |
+| Argument | Description | Example/Default |
+|----------|-------------|----------------|
+| `--compvis` | Enable visibility computation | Required for visibilities |
+| `--layout` | Antenna layout CSV file | `casm-13.csv` |
+| `--time-series` | Run time-series simulation | Required |
+| `--duration` | Duration in hours | `50` |
+| `--timestep` | Time step in minutes | `2` |
+| `--n-channels` | Number of frequency channels | `100` |
+| `--time` | Start time (UTC ISO format) | `2025-12-19T05:00:00` |
+
+## Timezone Handling
+
+**Important**: Timezone handling can be confusing:
+
+- **Input (`--time`)**: Specify in UTC ISO format (e.g., `2025-12-19T05:00:00`)
+- **Output folder name**: Uses PST (Pacific Standard Time) for readability (e.g., `results_20251218_2100_to_20251221_0400`)
+- **Stored timestamps (`mod_times` in NPZ)**: UTC ISO strings
+- **Usage**: Convert `mod_times` to PST in analysis (see `example.ipynb`)
 
 ## Outputs
 
-### Sky Maps
-The script generates sky maps at ~400 MHz to visualize the field of view:
-*   **`..._nomask.png`**: The raw sky model (Global Sky Model + Sun).
-*   **`..._masked.png`**: The sky model overlaid with a **red Gaussian opacity mask** representing the primary beam attenuation (Transparent at Zenith $\rightarrow$ Opaque at Horizon).
+- **Directory**: `results_YYYYMMDD_HHMM_to_YYYYMMDD_HHMM/` (PST timestamps)
+- **File**: `casm_visibilities_YYYYMMDD_HHMM_to_YYYYMMDD_HHMM.npz`
 
-### Data Format (`.npz`)
-The output `.npz` files contain:
-*   `visibilities`: Complex visibility array `(n_baselines, n_freq, 2, 2)`. Units: Flux Density (Jy).
-*   `uvw`: UVW coordinates in wavelengths `(n_baselines, n_freq, 3)`.
-*   `baselines`: Physical baseline vectors in meters.
-*   `baseline_pairs`: Antenna pair indices, shape `(n_baselines, 2)`.
-*   `frequencies`: Frequency array in MHz.
-*   `antenna_positions`: Antenna ENU coordinates.
+### NPZ Contents
+
+- `visibilities`: Complex array `(n_times, n_baselines, n_freq, 2, 2)` - Flux density in Jy
+- `times`: UTC ISO timestamp strings for each time step
+- `baselines`, `baseline_pairs`, `frequencies`, `antenna_positions`: Metadata
+- `source_names`, `source_alt`, `source_az`: Source positions per time step
+
+## Example Usage
+
+See `example.ipynb` for loading and analyzing the generated visibilities, including timezone conversion and comparison with observed data.
