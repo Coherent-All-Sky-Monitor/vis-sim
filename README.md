@@ -49,4 +49,4 @@ This creates a 50-hour simulation with 2-minute time steps, 100 frequency channe
 
 ## Example Usage
 
-See `example.ipynb` for loading and analyzing the generated visibilities, including timezone conversion and comparison with observed data.
+See `example.ipynb` for loading and analyzing the generated visibilities, including timezone conversion, frequency+time interpolation, and comparison with observed data.
