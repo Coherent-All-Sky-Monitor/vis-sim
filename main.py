@@ -38,8 +38,10 @@ OVRO_LAT = 37.234165  # degrees
 OVRO_LON = -118.283407  # degrees
 OVRO_ELEV = 1207.0  # meters
 
-# Primary beam solid angle (near zenith)
+# Primary beam parameters
 PRIMARY_BEAM_SOLID_ANGLE = 7500.0  # square degrees
+DEFAULT_BEAM_FWHM = np.sqrt(PRIMARY_BEAM_SOLID_ANGLE / (2 * np.pi)) * 2 * np.sqrt(2 * np.log(2))
+# For 7500 deg^2, DEFAULT_BEAM_FWHM is approximately 81.36 degrees.
 
 
 # --- SUN MODEL PARAMETERS ---
@@ -422,16 +424,18 @@ def calculate_uvw(baselines_meters, frequencies):
     return uvw
 
 
-def get_primary_beam_attenuation(pixel_directions):
+def get_primary_beam_attenuation(pixel_directions, beam_fwhm_deg=None):
     """
     Calculate primary beam attenuation P(theta) explicitly.
-    Assumes a Gaussian beam centered at zenith with solid angle PRIMARY_BEAM_SOLID_ANGLE.
+    Assumes a Gaussian beam centered at zenith.
     
     Parameters:
     -----------
     pixel_directions : array
         Unit vectors pointing to pixels in ENU, shape (n_pixels, 3)
         (l, m, n) where n is toward Zenith.
+    beam_fwhm_deg : float (optional)
+        FWHM of the beam in degrees. If None, uses PRIMARY_BEAM_SOLID_ANGLE.
         
     Returns:
     --------
@@ -446,10 +450,15 @@ def get_primary_beam_attenuation(pixel_directions):
     n_component = np.clip(n_component, -1.0, 1.0)
     theta = np.arccos(n_component)  # radians
     
-    # Calculate sigma from solid angle
-    # Omega = 2 * pi * sigma^2  => sigma = sqrt(Omega / 2pi)
-    solid_angle_sr = PRIMARY_BEAM_SOLID_ANGLE * (np.pi / 180.0)**2
-    sigma = np.sqrt(solid_angle_sr / (2 * np.pi))
+    # Calculate sigma
+    if beam_fwhm_deg is not None:
+        sigma_deg = beam_fwhm_deg / (2 * np.sqrt(2 * np.log(2)))
+        sigma = np.radians(sigma_deg)
+    else:
+        # Calculate sigma from solid angle
+        # Omega = 2 * pi * sigma^2  => sigma = sqrt(Omega / 2pi)
+        solid_angle_sr = PRIMARY_BEAM_SOLID_ANGLE * (np.pi / 180.0)**2
+        sigma = np.sqrt(solid_angle_sr / (2 * np.pi))
     
     # Gaussian profile: P(theta) = exp(-theta^2 / (2*sigma^2))
     attenuation = np.exp(- (theta**2) / (2 * sigma**2))
@@ -515,7 +524,8 @@ def plot_uv_coverage(uvw, highlight_indices=None, freq_idx=0, save_path=None):
 
 
 def generate_visibilities(antenna_mapping, frequencies, time_obs=None, n_sky_pixels=None, 
-                         custom_baselines=None, custom_baseline_pairs=None, base_sky_maps=None):
+                         custom_baselines=None, custom_baseline_pairs=None, base_sky_maps=None,
+                         beam_fwhm_deg=None):
     """
     Generate simulated visibilities for the CASM array using Van Cittert-Zernike formalism.
     
@@ -535,6 +545,8 @@ def generate_visibilities(antenna_mapping, frequencies, time_obs=None, n_sky_pix
         Corresponding antenna pairs
     base_sky_maps : array (optional)
         Pre-calculated base sky maps
+    beam_fwhm_deg : float (optional)
+        FWHM of the beam in degrees.
     
     Returns:
     --------
@@ -578,7 +590,7 @@ def generate_visibilities(antenna_mapping, frequencies, time_obs=None, n_sky_pix
     
     # Apply primary beam attenuation
     print("Applying Gaussian primary beam...")
-    beam_attenuation = get_primary_beam_attenuation(lmn)
+    beam_attenuation = get_primary_beam_attenuation(lmn, beam_fwhm_deg=beam_fwhm_deg)
     
     # Combine selection mask: visible AND significant beam support
     # (e.g., beam > 1e-6 to avoid unnecessary computation for nearly zero contribution)
@@ -607,16 +619,6 @@ def generate_visibilities(antenna_mapping, frequencies, time_obs=None, n_sky_pix
     visibilities = np.zeros((n_baselines, n_freq, N_POL, N_POL), dtype=complex)
     
     print(f"Computing visibilities for {n_baselines} baselines...")
-
-    # Computation Strategy:
-    # V(u,v,w) = Sum [ I_app(l,m) * exp(-2pi * i * (ul + vm + wn)) * dOmega ]
-    # term (ul + vm + wn) is the dot product of UVW vector and LMN vector.
-    
-    # We can vectorize over pixels for each frequency-baseline chunk.
-    # UVW: (n_baselines, n_freq, 3)
-    # LMN: (n_selected, 3)
-    
-    # To save memory, we invoke loop over frequencies or baselines
     
     for f_idx in range(n_freq):
         freq_hz = frequencies[f_idx] * 1e6 # Convert MHz to Hz
@@ -752,7 +754,7 @@ def get_all_sources_altaz(time_obs):
     return np.array(names), np.array(az_vals), np.array(alt_vals)
 
 
-def plot_sky_map_with_beam(sky_maps, pixel_altaz, frequencies, time_obs, output_dir='skymaps'):
+def plot_sky_map_with_beam(sky_maps, pixel_altaz, frequencies, time_obs, output_dir='skymaps', beam_fwhm_deg=None):
     """
     Plot sky maps for each frequency. Generates two versions:
     1. Unmasked (full sky)
@@ -770,6 +772,8 @@ def plot_sky_map_with_beam(sky_maps, pixel_altaz, frequencies, time_obs, output_
         Observation time
     output_dir : str
         Directory to save sky map images
+    beam_fwhm_deg : float (optional)
+        FWHM of the beam in degrees.
     """
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -832,9 +836,14 @@ def plot_sky_map_with_beam(sky_maps, pixel_altaz, frequencies, time_obs, output_
             
             if use_mask:
                 # Overlay Red Gaussian Mask
-                # Calculate sigma in radians from solid angle
-                solid_angle_sr = PRIMARY_BEAM_SOLID_ANGLE * (np.pi / 180.0)**2
-                sigma_rad = np.sqrt(solid_angle_sr / (2 * np.pi))
+                # Calculate sigma
+                if beam_fwhm_deg is not None:
+                    sigma_deg = beam_fwhm_deg / (2 * np.sqrt(2 * np.log(2)))
+                    sigma_rad = np.radians(sigma_deg)
+                else:
+                    # Calculate sigma in radians from solid angle
+                    solid_angle_sr = PRIMARY_BEAM_SOLID_ANGLE * (np.pi / 180.0)**2
+                    sigma_rad = np.sqrt(solid_angle_sr / (2 * np.pi))
                 
                 # Calculate theta grid (zenith angle in radians)
                 theta_rad = np.radians(radius)
@@ -889,7 +898,11 @@ def plot_sky_map_with_beam(sky_maps, pixel_altaz, frequencies, time_obs, output_
             
             # Add title
             mask_suffix = " (Masked)" if use_mask else ""
-            title = f'{freq:.2f} MHz{mask_suffix}\n{time_pst.strftime("%Y-%m-%d %H:%M:%S %Z")} PST\nPrimary Beam: {PRIMARY_BEAM_SOLID_ANGLE:.0f} deg²'
+            if beam_fwhm_deg:
+                beam_str = f"FWHM: {beam_fwhm_deg:.1f}°"
+            else:
+                beam_str = f"Area: {PRIMARY_BEAM_SOLID_ANGLE:.0f} deg²"
+            title = f'{freq:.2f} MHz{mask_suffix}\n{time_pst.strftime("%Y-%m-%d %H:%M:%S %Z")} PST\nBeam {beam_str}'
             ax.set_title(title, pad=20, fontsize=12)
             
             # Save individual image
@@ -934,7 +947,8 @@ def run_simulation_snapshot(time_obs, antenna_mapping, frequencies, args, output
         sky_maps_plot, pixel_directions_plot, pixel_altaz_plot = get_sky_model(plot_freqs, time_obs=time_obs, nside=64)
         
         print("   Visualizing sky maps...")
-        plot_sky_map_with_beam(sky_maps_plot, pixel_altaz_plot, plot_freqs, time_obs, output_dir=skymaps_dir)
+        plot_sky_map_with_beam(sky_maps_plot, pixel_altaz_plot, plot_freqs, time_obs, 
+                              output_dir=skymaps_dir, beam_fwhm_deg=args.beam_fwhm)
     
     # Step 5: Visibility Generation
     if args.compvis:
@@ -987,7 +1001,8 @@ def run_simulation_snapshot(time_obs, antenna_mapping, frequencies, args, output
             n_sky_pixels=1000,
             custom_baselines=calc_baselines,
             custom_baseline_pairs=calc_pairs,
-            base_sky_maps=base_sky_maps
+            base_sky_maps=base_sky_maps,
+            beam_fwhm_deg=args.beam_fwhm
         )
         
         # Save results
@@ -1067,7 +1082,8 @@ def run_time_series_simulation(start_time, duration_hours, timestep_minutes, ant
             n_sky_pixels=1000,
             custom_baselines=calc_baselines,
             custom_baseline_pairs=calc_pairs,
-            base_sky_maps=base_sky_maps
+            base_sky_maps=base_sky_maps,
+            beam_fwhm_deg=args.beam_fwhm
         )
         
         # Collect data
@@ -1103,6 +1119,62 @@ def run_time_series_simulation(start_time, duration_hours, timestep_minutes, ant
     print(f"Saved {len(times)} time snapshots in single file.")
 
 
+def run_tsky_mode(time_obs, frequencies, args):
+    """
+    Run in Tsky mode:
+    1. Dump skymaps at min and max frequency.
+    2. Calculate beam-weighted sky temperature as a function of frequency.
+    3. Save results to CSV.
+    """
+    pst = timezone('America/Los_Angeles')
+    time_pst = time_obs.to_datetime(timezone=pst)
+    time_str = time_pst.strftime('%Y%m%d_%H%M%S')
+    
+    print(f"\nRunning Tsky Mode at {time_obs.iso} ({time_pst.strftime('%Y-%m-%d %H:%M:%S %Z')})")
+    
+    # 1. Get sky model for all frequencies
+    n_freq = len(frequencies)
+    # nside=64 matches other parts of the code
+    sky_maps, pixel_directions, pixel_altaz = get_sky_model(frequencies, time_obs=time_obs, nside=64)
+    
+    # 2. Calculate primary beam attenuation
+    beam_attenuation = get_primary_beam_attenuation(pixel_directions, beam_fwhm_deg=args.beam_fwhm)
+    
+    # Only consider pixels above horizon
+    visible_mask = pixel_directions[:, 2] > 0
+    beam_visible = beam_attenuation[visible_mask]
+    sky_maps_visible = sky_maps[:, visible_mask]
+    
+    # Beam-weighted sky temperature: sum(T_sky * B) / sum(B)
+    # This represents the temperature the antenna "sees" through its beam
+    beam_sum = np.sum(beam_visible)
+    tsky_weighted = np.sum(sky_maps_visible * beam_visible[np.newaxis, :], axis=1) / beam_sum
+    
+    # Create output directory
+    output_dir = f"tsky_outputs_{time_str}_beam{args.beam_fwhm:.1f}deg"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 3. Save CSV
+    csv_filename = os.path.join(output_dir, f"tsky_weighted_{time_str}_beam{args.beam_fwhm:.1f}deg.csv")
+    
+    header = "frequency_mhz,tsky_weighted_k"
+    data_to_save = np.column_stack([frequencies, tsky_weighted])
+    np.savetxt(csv_filename, data_to_save, delimiter=',', header=header, comments='')
+    
+    print(f"   Saved beam-weighted Tsky to {csv_filename}")
+    
+    # 4. Dump skymaps at min and max freq
+    plot_freq_indices = [0, n_freq - 1]
+    plot_freqs = frequencies[plot_freq_indices]
+    plot_sky_maps = sky_maps[plot_freq_indices]
+    
+    print(f"   Generating sky maps for {plot_freqs[0]:.2f} and {plot_freqs[1]:.2f} MHz...")
+    plot_sky_map_with_beam(plot_sky_maps, pixel_altaz, plot_freqs, time_obs, 
+                          output_dir=output_dir, beam_fwhm_deg=args.beam_fwhm)
+    
+    print(f"   Tsky mode complete. All outputs saved in {output_dir}/")
+
+
 def main():
     """Main function to generate CASM visibilities."""
     parser = argparse.ArgumentParser(description='CASM Visibility Simulation')
@@ -1128,6 +1200,11 @@ def main():
                        help='Run in custom single-baseline mode with given NS (meters) and EW (meters) lengths. Ignores grid.')
     parser.add_argument('--layout', type=str, default='casm-13.csv',
                         help="Path to antenna layout CSV file (default: 'casm-13.csv')")
+    
+    parser.add_argument('--tsky', action='store_true',
+                       help='Run in Tsky mode: dump skymaps at min/max freq and beam-weighted Tsky CSV (default: False)')
+    parser.add_argument('--beam-fwhm', type=float, default=DEFAULT_BEAM_FWHM,
+                       help=f'Primary beam FWHM in degrees (default: {DEFAULT_BEAM_FWHM:.2f} deg, corresponding to {PRIMARY_BEAM_SOLID_ANGLE} deg²)')
 
     args = parser.parse_args()
     
@@ -1200,6 +1277,8 @@ def main():
     
     if args.time_series:
         run_time_series_simulation(time_obs, args.duration, args.timestep, antenna_mapping, frequencies, args)
+    elif args.tsky:
+        run_tsky_mode(time_obs, frequencies, args)
     else:
         run_simulation_snapshot(time_obs, antenna_mapping, frequencies, args)
     
