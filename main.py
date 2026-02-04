@@ -50,7 +50,6 @@ SUN_DIAMETER_DEG = 1.2       # degrees (Approximation for size at 400 MHz)
 SUN_SIGMA_DEG = SUN_DIAMETER_DEG / 2.355  # FWHM to Gaussian sigma: sigma = FWHM / (2*sqrt(2*ln(2)))
 target_ants = {4, 6, 7, 8, 9, 10, 11, 12}
 # -----------------------------
-
 def generate_antenna_positions(csv_path):
     """
     Reads antenna positions from a CSV file and converts them to a numpy array.
