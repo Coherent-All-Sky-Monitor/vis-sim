@@ -665,7 +665,7 @@ def generate_visibilities(
         base_sky_maps=base_sky_maps,
     )
 
-    sky_maps = np.zeros_like(sky_maps)
+    # sky_maps = np.zeros_like(sky_maps) # Commented out to allow actual sky model visibilities
 
     n_pixels = sky_maps.shape[1]
     lmn = pixel_directions  # (n_pixels, 3)
@@ -772,6 +772,222 @@ def generate_visibilities(
     }
 
     return result
+
+
+def generate_point_source_visibilities(
+    ra_deg,
+    dec_deg,
+    flux_jy,
+    frequencies,
+    antenna_mapping,
+    time_obs=None,
+    duration_s=1.0,
+    Trec_k=0.0,
+    a_eff_m2=0.2,
+    beam_fwhm_deg=None,
+    Tsky_eff_k=None,
+):
+    """
+    Generate simulated visibilities for a single point source.
+    Directly computes the phase for the source location without HEALPix maps.
+
+    Parameters
+    ----------
+    ra_deg : float
+        Right Ascension of the source in degrees.
+    dec_deg : float
+        Declination of the source in degrees.
+    flux_jy : float
+        Flux density of the source in Jy.
+    frequencies : array
+        Frequencies in MHz.
+    antenna_mapping : dict
+        Antenna position mapping dictionary.
+    time_obs : Time, optional
+        Observation time. Default is now.
+    duration_s : float, optional
+        Integration time in seconds. Used for noise calculation.
+    Trec_k : float, optional
+        Receiver temperature in Kelvin.
+    a_eff_m2 : float, optional
+        Effective collecting area per antenna in m^2.
+    beam_fwhm_deg : float, optional
+        FWHM of the primary beam in degrees.
+    Tsky_eff_k : array, optional
+        Sky temperature per frequency in K. If None, it is computed from the source 
+        flux density (Jy to K conversion).
+
+    Returns
+    -------
+    visibilities : array
+        Visibilities of shape (n_baselines, n_freq, 2, 2) in Jy.
+    """
+    if time_obs is None:
+        time_obs = Time.now()
+
+    # Observatory location
+    location = EarthLocation(
+        lat=OVRO_LAT * u.deg, lon=OVRO_LON * u.deg, height=OVRO_ELEV * u.m
+    )
+
+    # 1. Coordinate transformation: RA/Dec -> AltAz -> ENU unit vector
+    coord = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
+    altaz = coord.transform_to(AltAz(obstime=time_obs, location=location))
+
+    n_freq = len(frequencies)
+    baselines_meters, baseline_pairs = calculate_baselines(
+        antenna_mapping["positions"]
+    )
+    n_baselines = len(baselines_meters)
+
+    visibilities = np.zeros((n_baselines, n_freq, N_POL, N_POL), dtype=complex)
+
+    if altaz.alt.deg <= 0:
+        # Source is below horizon.
+        print(
+            f"   Source (RA={ra_deg}, Dec={dec_deg}) is below horizon (Alt={altaz.alt.deg:.1f})."
+        )
+        curr_beam_att = 0.0
+    else:
+        # Convert AltAz to ENU direction cosines (l, m, n)
+        # az=0 is North, az=90 is East.
+        # ENU: x=East, y=North, z=Up
+        az_rad = altaz.az.rad
+        alt_rad = altaz.alt.rad
+        l = np.cos(alt_rad) * np.sin(az_rad)
+        m = np.cos(alt_rad) * np.cos(az_rad)
+        n = np.sin(alt_rad)
+        l_unit = np.array([l, m, n])
+
+        # 2. Primary beam attenuation
+        curr_beam_att = get_primary_beam_attenuation(
+            l_unit[np.newaxis, :], beam_fwhm_deg=beam_fwhm_deg
+        )[0]
+
+        if curr_beam_att > 0:
+            # 3. Calculate UVW
+            uvw = calculate_uvw(baselines_meters, frequencies)
+
+            # 4. Generate visibilities
+            S_app = flux_jy * curr_beam_att
+            print(
+                f"   Generating visibilities for point source at Alt={altaz.alt.deg:.1f}, Az={altaz.az.deg:.1f}"
+            )
+            print(f"   Apparent flux (with beam): {S_app:.4f} Jy")
+
+            for f_idx in range(n_freq):
+                uvw_f = uvw[:, f_idx, :]  # (n_baselines, 3)
+                # Geometric phase for ENU: 2pi * (u*l + v*m + w*n)
+                phase_arg = np.dot(uvw_f, l_unit)
+                phasor = np.exp(-2j * np.pi * phase_arg)
+
+                vis_val = S_app * phasor
+                visibilities[:, f_idx, 0, 0] = vis_val
+                visibilities[:, f_idx, 1, 1] = vis_val
+        else:
+            print(
+                f"   Source is above horizon but suppressed by beam (beam_att={curr_beam_att:.2e})."
+            )
+
+    # 5. Compute Tsky_eff_k if not provided (similar to generate_visibilities)
+    # For a point source, we convert apparent flux (Jy) to beam-averaged temperature (K)
+    if Tsky_eff_k is None:
+        # T_A = (S_app * A_eff) / (2 * k_B)
+        # S_app is flux_jy * beam_att. If below horizon or outside beam, beam_att is 0.
+        S_app_total = flux_jy * curr_beam_att
+        # Convert Jy to K: (Jy * 1e-26 * A_eff) / (2 * k_B)
+        tsky_val = (S_app_total * 1e-26 * a_eff_m2) / (2 * K_BOLTZMANN)
+        
+        if np.isscalar(tsky_val):
+            Tsky_eff_k = np.full(n_freq, tsky_val)
+        else:
+            Tsky_eff_k = tsky_val
+            
+        # Note: This represents the contribution from the point source itself.
+        # In a real observation, one would also have the diffuse sky background (~100K).
+
+    # 6. Add thermal noise if Treceiver > 0
+    if Trec_k > 0:
+        print(
+            f"   Adding thermal noise (Duration={duration_s}s, Trec={Trec_k}K, Tsky={np.mean(Tsky_eff_k):.2f}K)..."
+        )
+        visibilities = add_thermal_noise(
+            visibilities=visibilities,
+            Trec_k=Trec_k,
+            Tsky_eff_k=Tsky_eff_k,
+            a_eff_m2=a_eff_m2,
+            frequencies=frequencies,
+            integration_time_s=duration_s,
+        )
+
+    return visibilities
+
+
+def inject_point_source(
+    visibilities,
+    ra_deg,
+    dec_deg,
+    flux_jy,
+    frequencies,
+    antenna_mapping,
+    time_obs=None,
+    duration_s=1.0,
+    Trec_k=0.0,
+    a_eff_m2=0.2,
+    beam_fwhm_deg=None,
+    Tsky_eff_k=None,
+):
+    """
+    Generate point source visibilities and add them to existing visibilities.
+
+    Parameters
+    ----------
+    visibilities : array
+        Existing visibilities of shape (n_baselines, n_freq, 2, 2) in Jy.
+    ra_deg : float
+        Right Ascension of the source in degrees.
+    dec_deg : float
+        Declination of the source in degrees.
+    flux_jy : float
+        Flux density of the source in Jy.
+    frequencies : array
+        Frequencies in MHz.
+    antenna_mapping : dict
+        Antenna position mapping dictionary.
+    time_obs : Time, optional
+        Observation time. Default is now.
+    duration_s : float, optional
+        Integration time in seconds. Used for noise calculation.
+    Trec_k : float, optional
+        Receiver temperature in Kelvin.
+    a_eff_m2 : float, optional
+        Effective collecting area per antenna in m^2.
+    beam_fwhm_deg : float, optional
+        FWHM of the primary beam in degrees.
+    Tsky_eff_k : array, optional
+        Sky temperature per frequency in K. If None, it is computed from the source 
+        flux density.
+
+    Returns
+    -------
+    vis_total : array
+        Combined visibilities (original + point source + noise if applicable).
+    """
+    ps_vis = generate_point_source_visibilities(
+        ra_deg=ra_deg,
+        dec_deg=dec_deg,
+        flux_jy=flux_jy,
+        frequencies=frequencies,
+        antenna_mapping=antenna_mapping,
+        time_obs=time_obs,
+        duration_s=duration_s,
+        Trec_k=Trec_k,
+        a_eff_m2=a_eff_m2,
+        beam_fwhm_deg=beam_fwhm_deg,
+        Tsky_eff_k=Tsky_eff_k,
+    )
+    return visibilities + ps_vis
+
 
 def plot_antenna_layout(antenna_mapping, save_path=None):
     """Plot the antenna array layout."""
