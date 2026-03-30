@@ -852,7 +852,7 @@ def plot_sky_map_with_beam(sky_maps, pixel_altaz, frequencies, time_obs, output_
                 beam_profile = np.exp(-0.5 * (theta_rad / sigma_rad)**2)
                 
                 # Mask opacity (0 where beam is 1, 1 where beam is 0)
-                mask_opacity = 1.0 - beam_profile
+                mask_opacity = 1.0 - beam_profile*0.5
                 
                 # Create gradient red colormap (Transparent -> Red)
                 # Using RGBA: (1, 0, 0, 0) to (1, 0, 0, 0.9)
@@ -1052,8 +1052,23 @@ def run_time_series_simulation(start_time, duration_hours, timestep_minutes, ant
     
     current_time = start_time
     time_idx = 0
+    
+    # Create skymaps directory if needed
+    if args.dump_skymaps:
+        skymaps_dir = os.path.join(results_dir, 'skymaps')
+        os.makedirs(skymaps_dir, exist_ok=True)
+
     while current_time <= end_time:
         print(f"\n--- Processing Snapshot {time_idx+1}: {current_time.iso} ---")
+        
+        if args.dump_skymaps:
+            print("   Generating sky model for visualization (400 MHz)...")
+            plot_freqs = np.array([400.0])
+            sky_maps_plot, _, pixel_altaz_plot = get_sky_model(plot_freqs, time_obs=current_time, nside=64)
+            
+            print("   Visualizing sky maps...")
+            plot_sky_map_with_beam(sky_maps_plot, pixel_altaz_plot, plot_freqs, current_time, 
+                                  output_dir=skymaps_dir, beam_fwhm_deg=args.beam_fwhm)
         
         # Generate visibilities
         calc_baselines = None
@@ -1191,6 +1206,8 @@ def main():
     # Time Series Arguments
     parser.add_argument('--time-series', action='store_true',
                        help='Run a time-series simulation (requires --test-baselines)')
+    parser.add_argument('--dump-skymaps', action='store_true',
+                       help='In time-series mode, dump skymaps at each timestamp (default: False)')
     parser.add_argument('--duration', type=float, default=24.0,
                        help='Duration of time series in hours (default: 24.0)')
     parser.add_argument('--timestep', type=float, default=15.0,
