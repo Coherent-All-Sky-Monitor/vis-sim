@@ -8,7 +8,7 @@ import argparse
 import os
 from astropy import units as u
 from astropy.coordinates import EarthLocation, AltAz, SkyCoord, get_sun
-from scipy.interpolate import griddata
+from scipy.interpolate import griddata, interp1d
 from astropy.time import Time
 from pytz import timezone
 from datetime import datetime, timedelta
@@ -26,9 +26,10 @@ N_ANTENNAS = N_ROWS * N_COLS  # 30 antennas
 N_POL = 2    # Two polarizations per antenna
 ARRAY_NS_LENGTH = 10.0  # meters (North-South)
 ARRAY_EW_LENGTH = 6.0   # meters (East-West)
-FREQ_MIN = 375.0  # MHz
-FREQ_MAX = 500.0  # MHz (375 + 93 MHz bandwidth)
+FREQ_MIN = 390.625  # MHz
+FREQ_MAX = FREQ_MIN + 93.75  # MHz (375 + 93 MHz bandwidth)
 FREQ_CENTER = (FREQ_MIN + FREQ_MAX) / 2.0  # MHz
+N_SKYMAP_CHANNELS = 100  # Always synthesize 100 skymaps for modelling
 
 C_LIGHT = 299792458.0    # Speed of light in m/s
 K_BOLTZMANN = 1.380649e-23 # Boltzmann constant in J/K
@@ -214,7 +215,7 @@ def convert_tb_to_intensity(T_b_map, frequency_hz):
     return I_map
 
 
-def add_sun_to_sky_model(sky_maps, frequencies, time_obs, sky_coords_icrs, nside=64):
+def add_sun_to_sky_model(sky_maps, vis_freqs, time_obs, sky_coords_icrs, nside=64):
     """
     Adds a Gaussian-profile Sun source to the sky map.
 
@@ -269,7 +270,7 @@ def add_sun_to_sky_model(sky_maps, frequencies, time_obs, sky_coords_icrs, nside
     return sky_maps_sun
 
 
-def generate_base_sky_model(frequencies, nside=64):
+def generate_base_sky_model(vis_freqs, nside=64):
     """
     Generate the time-independent component of the sky model (GSM) in Galactic coordinates.
     Includes persistent caching to speed up repeated runs.
@@ -278,9 +279,9 @@ def generate_base_sky_model(frequencies, nside=64):
     os.makedirs(cache_dir, exist_ok=True)
     
     # Create a unique filename based on parameters
-    f_min = frequencies[0]
-    f_max = frequencies[-1]
-    n_ch = len(frequencies)
+    f_min = vis_freqs[0]
+    f_max = vis_freqs[-1]
+    n_ch = len(vis_freqs)
     cache_filename = f"gsm_nch{n_ch}_fmin{f_min:.2f}_fmax{f_max:.2f}_nside{nside}.npy"
     cache_path = os.path.join(cache_dir, cache_filename)
     
@@ -296,11 +297,11 @@ def generate_base_sky_model(frequencies, nside=64):
         except Exception as e:
             print(f"   Error loading cache: {e}. Regenerating...")
             
-    print(f"   Pre-computing GSM background for {len(frequencies)} channels...")
+    print(f"   Pre-computing GSM background for {len(vis_freqs)} channels...")
     gsm = pygdsm.GlobalSkyModel16(freq_unit='MHz', data_unit='TCMB')
     sky_maps = []
     
-    for freq in frequencies:
+    for freq in vis_freqs:
         sky_map = gsm.generate(freq)
         map_nside = hp.get_nside(sky_map)
         if map_nside != nside:
@@ -316,13 +317,13 @@ def generate_base_sky_model(frequencies, nside=64):
     return sky_maps_arr
 
 
-def get_sky_model(frequencies, time_obs=None, nside=64, base_sky_maps=None):
+def get_sky_model(vis_freqs, time_obs=None, nside=64, base_sky_maps=None):
     """
     Generate sky model, add the Sun, and transform to local coordinates.
     
     Parameters:
     -----------
-    frequencies : array-like
+    vis_freqs : array-like
         Frequencies in MHz
     time_obs : Time
         Observation time for coordinate transformation
@@ -351,10 +352,10 @@ def get_sky_model(frequencies, time_obs=None, nside=64, base_sky_maps=None):
     if base_sky_maps is not None:
         sky_maps = base_sky_maps.copy() # Copy to avoid modifying the cached constant
     else:
-        sky_maps = generate_base_sky_model(frequencies, nside)
+        sky_maps = generate_base_sky_model(vis_freqs, nside)
     
     # 3. Add the Sun to the sky model (Time dependent)
-    sky_maps_sun = add_sun_to_sky_model(sky_maps, frequencies, time_obs, sky_coords_icrs, nside=nside)
+    sky_maps_sun = add_sun_to_sky_model(sky_maps, vis_freqs, time_obs, sky_coords_icrs, nside=nside)
     
     # Return the augmented map and coordinates
     return sky_maps_sun, pixel_directions, pixel_altaz
@@ -396,7 +397,7 @@ def calculate_baselines(antenna_positions):
     return baselines, baseline_pairs
 
 
-def calculate_uvw(baselines_meters, frequencies):
+def calculate_uvw(baselines_meters, vis_freqs):
     """
     Convert baselines from meters (ENU) to wavelengths (UVW) for each frequency.
     For a zenith-phased array, the coordinate systems align:
@@ -408,7 +409,7 @@ def calculate_uvw(baselines_meters, frequencies):
     -----------
     baselines_meters : array
         Baseline vectors in meters, shape (n_baselines, 3)
-    frequencies : array
+    vis_freqs : array
         Frequencies in MHz
         
     Returns:
@@ -417,7 +418,7 @@ def calculate_uvw(baselines_meters, frequencies):
         UVW coordinates, shape (n_baselines, n_freq, 3)
     """
     c = 299792458.0
-    lambdas = c / (frequencies * 1e6)  # Wavelengths in meters
+    lambdas = c / (vis_freqs * 1e6)  # Wavelengths in meters
     
     # Broadcast division: (B, 1, 3) / (1, F, 1) -> (B, F, 3)
     uvw = baselines_meters[:, np.newaxis, :] / lambdas[np.newaxis, :, np.newaxis]
@@ -528,7 +529,7 @@ def add_thermal_noise(
     Trec_k,
     Tsky_eff_k,
     a_eff_m2,
-    frequencies,
+    vis_freqs,
     integration_time_s,
 ):
     """
@@ -564,7 +565,7 @@ def add_thermal_noise(
 
     # Channel bandwidth
     if n_freq > 1:
-        df = (frequencies[-1] - frequencies[0]) / (n_freq - 1)
+        df = (vis_freqs[-1] - vis_freqs[0]) / (n_freq - 1)
     else:
         df = FREQ_MAX - FREQ_MIN  # MHz
 
@@ -592,7 +593,7 @@ def add_thermal_noise(
 
 def generate_visibilities(
     antenna_mapping,
-    frequencies,
+    vis_freqs,
     time_obs=None,
     n_sky_pixels=None,
     custom_baselines=None,
@@ -643,7 +644,12 @@ def generate_visibilities(
 
     positions = antenna_mapping["positions"]
     n_ant = antenna_mapping["n_antennas"]
-    n_freq = len(frequencies)
+    
+    # We always use N_SKYMAP_CHANNELS base frequencies for sky modelling (mod_freqs)
+    # and then interpolate up to the full 'vis_freqs' (e.g. 3072 channels)
+    mod_freqs = np.linspace(FREQ_MIN, FREQ_MAX, N_SKYMAP_CHANNELS)
+    n_mod_freqs = len(mod_freqs)
+    n_vis_freqs = len(vis_freqs)
 
     if custom_baselines is not None and custom_baseline_pairs is not None:
         baselines_meters = custom_baselines
@@ -653,19 +659,18 @@ def generate_visibilities(
 
     n_baselines = len(baselines_meters)
 
-    # UVW coordinates [n_baselines, n_freq, 3]
-    uvw = calculate_uvw(baselines_meters, frequencies)
+    # UVW coordinates [n_baselines, n_mod_freqs, 3] for modelling
+    uvw_mod = calculate_uvw(baselines_meters, mod_freqs)
 
-    # Sky model
-    print(f"Generating sky model for {n_freq} frequencies...")
+    # Sky model at modelling frequencies
+    print(f"Generating sky model for {n_mod_freqs} frequencies...")
     sky_maps, pixel_directions, pixel_altaz = get_sky_model(
-        frequencies,
+        mod_freqs,
         time_obs=time_obs,
         nside=64,
         base_sky_maps=base_sky_maps,
     )
 
-    sky_maps = np.zeros_like(sky_maps)
 
     n_pixels = sky_maps.shape[1]
     lmn = pixel_directions  # (n_pixels, 3)
@@ -678,7 +683,6 @@ def generate_visibilities(
         beam_fwhm_deg=beam_fwhm_deg,
     )
 
-    beam_attenuation = np.ones_like(beam_attenuation)
 
     selection_mask = visible_mask & (beam_attenuation > 1e-6)
     selected_indices = np.where(selection_mask)[0]
@@ -695,8 +699,9 @@ def generate_visibilities(
 
     apparent_sky = sky_maps_selected * beam_value_selected[np.newaxis, :]
 
-    visibilities = np.zeros(
-        (n_baselines, n_freq, N_POL, N_POL),
+    # Instantaneous visibilities at modelling frequencies
+    vis_mod = np.zeros(
+        (n_baselines, n_mod_freqs, N_POL, N_POL),
         dtype=complex,
     )
 
@@ -715,25 +720,45 @@ def generate_visibilities(
 
     print(f"Computing visibilities for {n_baselines} baselines...")
 
-    for f_idx in range(n_freq):
-        freq_hz = frequencies[f_idx] * 1e6
+    for f_idx in range(n_mod_freqs):
+        freq_hz = mod_freqs[f_idx] * 1e6
 
         T_b_apparent = apparent_sky[f_idx]
         I_apparent = convert_tb_to_intensity(T_b_apparent, freq_hz)
 
         I_app_term = I_apparent * pixel_area
 
-        uvw_f = uvw[:, f_idx, :]
+        uvw_f = uvw_mod[:, f_idx, :]
         phase_arg = np.dot(uvw_f, lmn_selected.T)
         phasor = np.exp(-2j * np.pi * phase_arg)
 
         vis_val = np.dot(phasor, I_app_term) * 1e26  # Jy
 
-        visibilities[:, f_idx, 0, 0] = vis_val
-        visibilities[:, f_idx, 1, 1] = vis_val
+        vis_mod[:, f_idx, 0, 0] = vis_val
+        vis_mod[:, f_idx, 1, 1] = vis_val
 
         if f_idx % 10 == 0:
-            print(f"Processed frequency channel {f_idx}/{n_freq}")
+            print(f"Processed frequency channel {f_idx}/{n_mod_freqs}")
+
+    # Interpolate visibilities from n_mod_freqs up to n_vis_freqs
+    print(f"Interpolating visibilities from {n_mod_freqs} up to {n_vis_freqs} channels...")
+    vis_interpolator = interp1d(
+        mod_freqs,
+        vis_mod,
+        kind="linear",
+        axis=1,
+        fill_value="extrapolate",
+    )
+    visibilities = vis_interpolator(vis_freqs)
+
+    # Also interpolate the beam-weighted sky temperature for noise calculation
+    tsky_interpolator = interp1d(
+        mod_freqs,
+        tsky_weighted,
+        kind="linear",
+        fill_value="extrapolate",
+    )
+    tsky_interpolated = tsky_interpolator(vis_freqs)
 
     if Trec_k > 0:
         # a_eff_m2 now has a sensible default, but still ensure it's positive
@@ -747,24 +772,27 @@ def generate_visibilities(
         visibilities = add_thermal_noise(
             visibilities=visibilities,
             Trec_k=Trec_k,
-            Tsky_eff_k=tsky_weighted,
+            Tsky_eff_k=tsky_interpolated,
             a_eff_m2=a_eff_m2,
-            frequencies=frequencies,
+            vis_freqs=vis_freqs,
             integration_time_s=integration_time_s,
         )
 
     src_names, src_az, src_alt = get_all_sources_altaz(time_obs)
 
+    # UVW coordinates [n_baselines, n_vis_freqs, 3] for final result
+    uvw_vis = calculate_uvw(baselines_meters, vis_freqs)
+
     result = {
         "visibilities": visibilities,
         "baselines": baselines_meters,
-        "uvw": uvw,
+        "uvw": uvw_vis,
         "baseline_pairs": baseline_pairs,
-        "frequencies": frequencies,
+        "frequencies": vis_freqs,
         "time_obs": time_obs,
         "n_antennas": n_ant,
         "n_baselines": n_baselines,
-        "n_freq": n_freq,
+        "n_freq": n_vis_freqs,
         "pixel_altaz": pixel_altaz,
         "source_names": src_names,
         "source_az": src_az,
@@ -850,7 +878,7 @@ def get_all_sources_altaz(time_obs):
     return np.array(names), np.array(az_vals), np.array(alt_vals)
 
 
-def plot_sky_map_with_beam(sky_maps, pixel_altaz, frequencies, time_obs, output_dir='skymaps', beam_fwhm_deg=None):
+def plot_sky_map_with_beam(sky_maps, pixel_altaz, vis_freqs, time_obs, output_dir='skymaps', beam_fwhm_deg=None):
     """
     Plot sky maps for each frequency. Generates two versions:
     1. Unmasked (full sky)
@@ -902,7 +930,7 @@ def plot_sky_map_with_beam(sky_maps, pixel_altaz, frequencies, time_obs, output_
     time_str = time_pst.strftime('%Y%m%d_%H%M%S')
     
     # Process each frequency separately
-    for f_idx, freq in enumerate(frequencies):
+    for f_idx, freq in enumerate(vis_freqs):
         # Get sky map for this frequency
         sky_map = sky_maps[f_idx]
         visible_sky = sky_map[visible_mask]
@@ -1009,10 +1037,10 @@ def plot_sky_map_with_beam(sky_maps, pixel_altaz, frequencies, time_obs, output_
             
             print(f"   Saved: {filename}")
     
-    print(f"   Generated {len(frequencies) * 2} sky map images in {output_dir}/")
+    print(f"   Generated {len(vis_freqs) * 2} sky map images in {output_dir}/")
 
 
-def run_simulation_snapshot(time_obs, antenna_mapping, frequencies, args, output_base_dir=None, base_sky_maps=None, generate_skymaps=True):
+def run_simulation_snapshot(time_obs, antenna_mapping, vis_freqs, args, output_base_dir=None, base_sky_maps=None, generate_skymaps=True):
     """
     Run a single simulation snapshot for a given time.
     """
@@ -1028,15 +1056,17 @@ def run_simulation_snapshot(time_obs, antenna_mapping, frequencies, args, output
     print(f"\n--- Processing Snapshot: {time_str_log} ---")
     
     # Determine output directories
-    if output_base_dir:
-        skymaps_dir = os.path.join(output_base_dir, 'skymaps')
-        vis_dir = os.path.join(output_base_dir, 'visibilities')
-        os.makedirs(skymaps_dir, exist_ok=True)
-        os.makedirs(vis_dir, exist_ok=True)
-        vis_filename = os.path.join(vis_dir, f'casm_visibilities_{layout_name}_{time_str_file}.npz')
-    else:
-        skymaps_dir = 'skymaps'
-        vis_filename = f'casm_visibilities_{layout_name}_test.npz' if args.test_baselines else f'casm_visibilities_{layout_name}.npz'
+    created_dir = False
+    if not output_base_dir:
+        output_base_dir = f"results_{layout_name}_{time_str_file}"
+        print(f"Output Directory: {output_base_dir}")
+        created_dir = True
+        
+    skymaps_dir = os.path.join(output_base_dir, 'skymaps')
+    vis_dir = os.path.join(output_base_dir, 'visibilities')
+    os.makedirs(skymaps_dir, exist_ok=True)
+    os.makedirs(vis_dir, exist_ok=True)
+    vis_filename = os.path.join(vis_dir, f'casm_visibilities_{layout_name}_{time_str_file}.npz')
 
     # Step 3: Visual Sky Model (400 MHz)
     # Only generating visualization when requested (implicit usually, but good to have)
@@ -1087,15 +1117,15 @@ def run_simulation_snapshot(time_obs, antenna_mapping, frequencies, args, output
             calc_baselines = all_baselines[test_indices]
             calc_pairs = all_pairs[test_indices]
             
-            # Only plot UV coverage on first run or if single run (handled by caller generally, but OK here)
-            if not output_base_dir: 
+            # Only plot UV coverage on first run or if single run
+            if created_dir: 
                 print("   Generating UV coverage plot...")
-                uvw_all = calculate_uvw(all_baselines, frequencies)
-                plot_uv_coverage(uvw_all, highlight_indices=test_indices, freq_idx=len(frequencies)//2, save_path='casm_uv_coverage_test.png')
+                uvw_all = calculate_uvw(all_baselines, vis_freqs)
+                plot_uv_coverage(uvw_all, highlight_indices=test_indices, freq_idx=len(vis_freqs)//2, save_path=os.path.join(output_base_dir, 'casm_uv_coverage_test.png'))
 
         vis_data = generate_visibilities(
             antenna_mapping,
-            frequencies,
+            vis_freqs,
             time_obs=time_obs,
             n_sky_pixels=1000,
             custom_baselines=calc_baselines,
@@ -1125,7 +1155,7 @@ def run_simulation_snapshot(time_obs, antenna_mapping, frequencies, args, output
         )
 
 
-def run_time_series_simulation(start_time, duration_hours, timestep_minutes, antenna_mapping, frequencies, args):
+def run_time_series_simulation(start_time, duration_hours, timestep_minutes, antenna_mapping, vis_freqs, args):
     """
     Run a time-series simulation.
     """
@@ -1144,8 +1174,9 @@ def run_time_series_simulation(start_time, duration_hours, timestep_minutes, ant
     print(f"\nStarting Time Series Simulation: {duration_hours} hours, {timestep_minutes} min steps")
     print(f"Output Directory: {results_dir}")
     
-    # Pre-compute base sky maps (GSM)
-    base_sky_maps = generate_base_sky_model(frequencies, nside=64)
+    # Pre-compute base sky maps (GSM) at modeling resolution (100 channels)
+    mod_freqs = np.linspace(FREQ_MIN, FREQ_MAX, N_SKYMAP_CHANNELS)
+    base_sky_maps = generate_base_sky_model(mod_freqs, nside=64)
     
     # Initialize lists to collect data
     times = []
@@ -1196,7 +1227,7 @@ def run_time_series_simulation(start_time, duration_hours, timestep_minutes, ant
         
         vis_data = generate_visibilities(
             antenna_mapping,
-            frequencies,
+            vis_freqs,
             time_obs=current_time,
             n_sky_pixels=1000,
             custom_baselines=calc_baselines,
@@ -1240,7 +1271,7 @@ def run_time_series_simulation(start_time, duration_hours, timestep_minutes, ant
     print(f"Saved {len(times)} time snapshots in single file.")
 
 
-def run_tsky_mode(time_obs, frequencies, args):
+def run_tsky_mode(time_obs, vis_freqs, args):
     """
     Run in Tsky mode:
     1. Dump skymaps at min and max frequency.
@@ -1256,10 +1287,11 @@ def run_tsky_mode(time_obs, frequencies, args):
     
     print(f"\nRunning Tsky Mode at {time_obs.iso} ({time_pst.strftime('%Y-%m-%d %H:%M:%S %Z')})")
     
-    # 1. Get sky model for all frequencies
-    n_freq = len(frequencies)
-    # nside=64 matches other parts of the code
-    sky_maps, pixel_directions, pixel_altaz = get_sky_model(frequencies, time_obs=time_obs, nside=64)
+    # 1. Get sky model for base frequencies (100)
+    mod_freqs = np.linspace(FREQ_MIN, FREQ_MAX, N_SKYMAP_CHANNELS)
+    n_mod_freqs = len(mod_freqs)
+    
+    sky_maps, pixel_directions, pixel_altaz = get_sky_model(mod_freqs, time_obs=time_obs, nside=64)
     
     # 2. Calculate primary beam attenuation
     beam_attenuation = get_primary_beam_attenuation(pixel_directions, beam_fwhm_deg=args.beam_fwhm)
@@ -1272,24 +1304,29 @@ def run_tsky_mode(time_obs, frequencies, args):
     # Beam-weighted sky temperature: sum(T_sky * B) / sum(B)
     # This represents the temperature the antenna "sees" through its beam
     beam_sum = np.sum(beam_visible)
-    tsky_weighted = np.sum(sky_maps_visible * beam_visible[np.newaxis, :], axis=1) / beam_sum
+    tsky_weighted_mod = np.sum(sky_maps_visible * beam_visible[np.newaxis, :], axis=1) / beam_sum
+    
+    # Interpolate Tsky to full vis_freqs resolution
+    print(f"   Interpolating Tsky to {len(vis_freqs)} channels...")
+    tsky_interpolator = interp1d(mod_freqs, tsky_weighted_mod, kind='linear', fill_value='extrapolate')
+    tsky_weighted_vis = tsky_interpolator(vis_freqs)
     
     # Create output directory
     output_dir = f"tsky_outputs_{layout_name}_{time_str}_beam{args.beam_fwhm:.1f}deg"
     os.makedirs(output_dir, exist_ok=True)
     
-    # 3. Save CSV
+    # 3. Save CSV with full resolution
     csv_filename = os.path.join(output_dir, f"tsky_weighted_{layout_name}_{time_str}_beam{args.beam_fwhm:.1f}deg.csv")
     
     header = "frequency_mhz,tsky_weighted_k"
-    data_to_save = np.column_stack([frequencies, tsky_weighted])
+    data_to_save = np.column_stack([vis_freqs, tsky_weighted_vis])
     np.savetxt(csv_filename, data_to_save, delimiter=',', header=header, comments='')
     
     print(f"   Saved beam-weighted Tsky to {csv_filename}")
     
-    # 4. Dump skymaps at min and max freq
-    plot_freq_indices = [0, n_freq - 1]
-    plot_freqs = frequencies[plot_freq_indices]
+    # 4. Dump skymaps at min and max freq of the modelling grid (always 100)
+    plot_freq_indices = [0, n_mod_freqs - 1]
+    plot_freqs = mod_freqs[plot_freq_indices]
     plot_sky_maps = sky_maps[plot_freq_indices]
     
     print(f"   Generating sky maps for {plot_freqs[0]:.2f} and {plot_freqs[1]:.2f} MHz...")
@@ -1304,8 +1341,8 @@ def main():
     parser = argparse.ArgumentParser(description='CASM Visibility Simulation')
     parser.add_argument('--compvis', action='store_true',
                        help='Compute visibilities (default: False, only generate sky maps)')
-    parser.add_argument('--n-channels', type=int, default=100,
-                       help='Number of frequency channels (default: 100)')
+    parser.add_argument('--n-channels', type=int, default=3072,
+                       help='Number of frequency channels (default: 3072)')
     parser.add_argument('--time', type=str, default=None,
                        help='Observation time. Formats: HH:MM (PST today) OR ISO-8601 (YYYY-MM-DDTHH:MM:SS)')
     
@@ -1404,16 +1441,16 @@ def main():
         plot_antenna_layout(antenna_mapping, save_path='casm_antenna_layout.png')
     
     # Step 2: Define frequency range
-    print("\n2. Setting up frequency range...")
+    print(f"\n2. Setting up frequency range ({args.n_channels} channels)...")
     n_channels = args.n_channels
-    frequencies = np.linspace(FREQ_MIN, FREQ_MAX, n_channels)
+    vis_freqs = np.linspace(FREQ_MIN, FREQ_MAX, n_channels)
     
     if args.time_series:
-        run_time_series_simulation(time_obs, args.duration, args.timestep, antenna_mapping, frequencies, args)
+        run_time_series_simulation(time_obs, args.duration, args.timestep, antenna_mapping, vis_freqs, args)
     elif args.tsky:
-        run_tsky_mode(time_obs, frequencies, args)
+        run_tsky_mode(time_obs, vis_freqs, args)
     else:
-        run_simulation_snapshot(time_obs, antenna_mapping, frequencies, args)
+        run_simulation_snapshot(time_obs, antenna_mapping, vis_freqs, args)
     
     print("\n" + "=" * 60)
     print("Simulation complete!")
