@@ -48,7 +48,7 @@ DEFAULT_BEAM_FWHM = np.sqrt(PRIMARY_BEAM_SOLID_ANGLE / (2 * np.pi)) * 2 * np.sqr
 SUN_BRIGHTNESS_TEMP = 8.0e5  # K (Approximation for Quiet Sun T_b)
 SUN_DIAMETER_DEG = 1.2       # degrees (Approximation for size at 400 MHz)
 SUN_SIGMA_DEG = SUN_DIAMETER_DEG / 2.355  # FWHM to Gaussian sigma: sigma = FWHM / (2*sqrt(2*ln(2)))
-target_ants = {4, 6, 7, 8, 9, 10, 11, 12}
+# target_ants = {4, 6, 7, 8, 9, 10, 11, 12}
 # -----------------------------
 
 def generate_antenna_positions(csv_path):
@@ -380,7 +380,8 @@ def calculate_baselines(antenna_positions):
     baselines = []
     baseline_pairs = []
     
-    target_list = sorted(target_ants)
+    # target_list = sorted(target_ants)
+    target_list = np.arange(n_ant)
     
     for i in target_list:
         for j in target_list:
@@ -522,15 +523,92 @@ def plot_uv_coverage(uvw, highlight_indices=None, freq_idx=0, save_path=None):
         plt.show()
     plt.close()
 
-
-def generate_visibilities(antenna_mapping, frequencies, time_obs=None, n_sky_pixels=None, 
-                         custom_baselines=None, custom_baseline_pairs=None, base_sky_maps=None,
-                         beam_fwhm_deg=None):
+def add_thermal_noise(
+    visibilities,
+    Trec_k,
+    Tsky_eff_k,
+    a_eff_m2,
+    frequencies,
+    integration_time_s,
+):
     """
-    Generate simulated visibilities for the CASM array using Van Cittert-Zernike formalism.
-    
-    Parameters:
-    -----------
+    Add physically correct thermal noise to visibilities.
+
+    Parameters
+    ----------
+    visibilities : array
+        Shape (n_baselines, n_freq, N_POL, N_POL), units Jy
+    Trec_k : float
+        Receiver temperature (K)
+    Tsky_eff_k : array
+        Beam-weighted sky temperature per frequency (K), shape (n_freq,)
+    a_eff_m2 : float
+        Effective collecting area per antenna (m^2)
+    frequencies : array
+        Frequencies in MHz
+    integration_time_s : float
+        Integration time per visibility sample (seconds)
+
+    Returns
+    -------
+    visibilities_noisy : array
+        Visibilities with thermal noise added (Jy)
+    """
+
+    if Trec_k <= 0:
+        return visibilities
+
+    k_B = 1.380649e-23
+
+    n_baselines, n_freq, n_pol, _ = visibilities.shape
+
+    # Channel bandwidth
+    if n_freq > 1:
+        df = (frequencies[-1] - frequencies[0]) / (n_freq - 1)
+    else:
+        df = FREQ_MAX - FREQ_MIN  # MHz
+
+    df_hz = df * 1e6
+
+    # Total system temperature per frequency
+    Tsys = Trec_k + Tsky_eff_k  # shape (n_freq,)
+
+    # SEFD per antenna (Jy)
+    sefd = (2 * k_B * Tsys / a_eff_m2) * 1e26  # shape (n_freq,)
+
+    # Visibility RMS per baseline (Jy)
+    sigma = sefd / np.sqrt(2 * df_hz * integration_time_s)  # shape (n_freq,)
+
+    # Broadcast sigma to full visibility shape
+    sigma = sigma[np.newaxis, :, np.newaxis, np.newaxis]
+
+    noise = (
+        np.random.normal(0, sigma, visibilities.shape)
+        + 1j * np.random.normal(0, sigma, visibilities.shape)
+    )
+
+    return visibilities + noise
+
+
+def generate_visibilities(
+    antenna_mapping,
+    frequencies,
+    time_obs=None,
+    n_sky_pixels=None,
+    custom_baselines=None,
+    custom_baseline_pairs=None,
+    base_sky_maps=None,
+    beam_fwhm_deg=None,
+    Trec_k=0.0,
+    a_eff_m2: float = 0.2,
+    integration_time_s=1.0,
+):
+    """
+    Generate simulated visibilities for the CASM array
+    using Van Cittert-Zernike formalism.
+
+    Parameters
+    ----------
     antenna_mapping : dict
         Antenna position mapping dictionary
     frequencies : array
@@ -539,143 +617,161 @@ def generate_visibilities(antenna_mapping, frequencies, time_obs=None, n_sky_pix
         Observation time (default: current time)
     n_sky_pixels : int
         (Deprecated) Number of sky pixels is determined by nside within get_sky_model
-    custom_baselines : array (optional)
+    custom_baselines : array, optional
         Pre-calculated or subset of baselines (meters)
-    custom_baseline_pairs : array (optional)
+    custom_baseline_pairs : array, optional
         Corresponding antenna pairs
-    base_sky_maps : array (optional)
+    base_sky_maps : array, optional
         Pre-calculated base sky maps
-    beam_fwhm_deg : float (optional)
-        FWHM of the beam in degrees.
-    
-    Returns:
-    --------
-    visibilities : dict
+    beam_fwhm_deg : float, optional
+        FWHM of the beam in degrees
+    Trec_k : float, optional
+        Receiver temperature (K) for thermal noise addition. Default is 0 (no noise).
+    a_eff_m2 : float, optional
+        Effective collecting area per antenna (m^2). Defaults to 0.2 m^2.
+    integration_time_s : float, optional
+        Integration time per visibility sample (seconds).  (``--exptime`` on CLI)
+
+    Returns
+    -------
+    result : dict
         Dictionary containing visibility data
     """
+
     if time_obs is None:
         time_obs = Time.now()
-    
-    positions = antenna_mapping['positions']
-    n_ant = antenna_mapping['n_antennas']
+
+    positions = antenna_mapping["positions"]
+    n_ant = antenna_mapping["n_antennas"]
     n_freq = len(frequencies)
-    
+
     if custom_baselines is not None and custom_baseline_pairs is not None:
         baselines_meters = custom_baselines
         baseline_pairs = custom_baseline_pairs
     else:
-        # Calculate baselines in meters
         baselines_meters, baseline_pairs = calculate_baselines(positions)
-    
+
     n_baselines = len(baselines_meters)
-    
-    # Calculate UVW coordinates [n_baselines, n_freq, 3]
-    # For zenith pointing: u=East, v=North, w=Up
+
+    # UVW coordinates [n_baselines, n_freq, 3]
     uvw = calculate_uvw(baselines_meters, frequencies)
-    
-    # Get sky model
+
+    # Sky model
     print(f"Generating sky model for {n_freq} frequencies...")
-    # Use nside=64 for ~49,000 pixels (resolution ~1 deg)
-    sky_maps, pixel_directions, pixel_altaz = get_sky_model(frequencies, time_obs=time_obs, nside=64, base_sky_maps=base_sky_maps)
+    sky_maps, pixel_directions, pixel_altaz = get_sky_model(
+        frequencies,
+        time_obs=time_obs,
+        nside=64,
+        base_sky_maps=base_sky_maps,
+    )
+
+    sky_maps = np.zeros_like(sky_maps)
+
     n_pixels = sky_maps.shape[1]
-    
-    # Calculate direction cosines (l, m, n)
-    # pixel_directions is (n_pixels, 3) -> (East, North, Up) -> (l, m, n)
-    # l points East, m points North, n points Up (toward phase center/zenith)
-    lmn = pixel_directions  # Shape (n_pixels, 3)
-    
-    # Identify visible pixels (horizon check)
-    # n = lmn[:, 2] is the Up component
+    lmn = pixel_directions  # (n_pixels, 3)
+
     visible_mask = lmn[:, 2] > 0
-    
-    # Apply primary beam attenuation
+
     print("Applying Gaussian primary beam...")
-    beam_attenuation = get_primary_beam_attenuation(lmn, beam_fwhm_deg=beam_fwhm_deg)
-    
-    # Combine selection mask: visible AND significant beam support
-    # (e.g., beam > 1e-6 to avoid unnecessary computation for nearly zero contribution)
+    beam_attenuation = get_primary_beam_attenuation(
+        lmn,
+        beam_fwhm_deg=beam_fwhm_deg,
+    )
+
+    beam_attenuation = np.ones_like(beam_attenuation)
+
     selection_mask = visible_mask & (beam_attenuation > 1e-6)
-    
     selected_indices = np.where(selection_mask)[0]
     n_selected = len(selected_indices)
-    
-    print(f"   Integrating over {n_selected} pixels (visible & within beam)")
-    
-    # Filter data for selected pixels
-    lmn_selected = lmn[selected_indices]  # (n_selected, 3)
-    beam_value_selected = beam_attenuation[selected_indices] # (n_selected,)
-    sky_maps_selected = sky_maps[:, selected_indices]  # (n_freq, n_selected)
-    
-    # Calculate pixel solid angle (dOmega)
-    nside = hp.npix2nside(n_pixels)
-    pixel_area = hp.nside2pixarea(nside)  # steradians
-    
-    # Apparent Sky Brightness: I_app(l,m) = I_sky(l,m) * A(l,m)
-    # Shape: (n_freq, n_selected)
-    apparent_sky = sky_maps_selected * beam_value_selected[np.newaxis, :]
-    
-    # Initialize visibility array
-    # Shape: (n_baselines, n_freq, N_POL, N_POL)
-    visibilities = np.zeros((n_baselines, n_freq, N_POL, N_POL), dtype=complex)
-    
-    print(f"Computing visibilities for {n_baselines} baselines...")
-    
-    for f_idx in range(n_freq):
-        freq_hz = frequencies[f_idx] * 1e6 # Convert MHz to Hz
-        
-        # --- FIX: CONVERT T_B to I_app (Specific Intensity) ---
-        # I_app is the apparent intensity I * A (in W/m²/Hz/sr)
-        T_b_apparent = apparent_sky[f_idx] # K
-        I_apparent = convert_tb_to_intensity(T_b_apparent, freq_hz) # W/m²/Hz/sr
-        # -----------------------------------------------------
 
-        # I_app_term is the quantity to be summed: I_apparent * dOmega 
-        # Unit: (W/m²/Hz/sr) * (sr) = W/m²/Hz (Flux Density)
+    print(f"Integrating over {n_selected} pixels (visible & within beam)")
+
+    lmn_selected = lmn[selected_indices]
+    beam_value_selected = beam_attenuation[selected_indices]
+    sky_maps_selected = sky_maps[:, selected_indices]
+
+    nside = hp.npix2nside(n_pixels)
+    pixel_area = hp.nside2pixarea(nside)
+
+    apparent_sky = sky_maps_selected * beam_value_selected[np.newaxis, :]
+
+    visibilities = np.zeros(
+        (n_baselines, n_freq, N_POL, N_POL),
+        dtype=complex,
+    )
+
+    # Beam-weighted sky temperature
+    beam_visible = beam_attenuation[visible_mask]
+    sky_maps_visible = sky_maps[:, visible_mask]
+
+    beam_sum = np.sum(beam_visible)
+    tsky_weighted = (
+        np.sum(
+            sky_maps_visible * beam_visible[np.newaxis, :],
+            axis=1,
+        )
+        / beam_sum
+    )
+
+    print(f"Computing visibilities for {n_baselines} baselines...")
+
+    for f_idx in range(n_freq):
+        freq_hz = frequencies[f_idx] * 1e6
+
+        T_b_apparent = apparent_sky[f_idx]
+        I_apparent = convert_tb_to_intensity(T_b_apparent, freq_hz)
+
         I_app_term = I_apparent * pixel_area
-        
-        # Get UVW for this freq: shape (n_baselines, 3)
+
         uvw_f = uvw[:, f_idx, :]
-        
-        # Calculate phase term: dot(UVW, LMN.T) -> shape (n_baselines, n_selected)
-        # argument = ul + vm + wn
-        # This matrix multiply can be large: n_bl(3600?) * n_pix(20000?) ~ 72e6 complex64 ~ 500MB. OK.
         phase_arg = np.dot(uvw_f, lmn_selected.T)
-        
-        # Exponential term
         phasor = np.exp(-2j * np.pi * phase_arg)
-        
-        # Summation: Vis = dot(phasor, I_app_term)
-        # (n_baselines, n_selected) dot (n_selected,) -> (n_baselines,)
-        vis_val = np.dot(phasor, I_app_term) * 1e26 # Flux density in Jy
-        
-        # Assign to XX and YY pols
+
+        vis_val = np.dot(phasor, I_app_term) * 1e26  # Jy
+
         visibilities[:, f_idx, 0, 0] = vis_val
         visibilities[:, f_idx, 1, 1] = vis_val
-        
-        if f_idx % 10 == 0:
-            print(f"   Processed frequency channel {f_idx}/{n_freq}")
-            
-    # Calculate visible source positions
-    src_names, src_az, src_alt = get_all_sources_altaz(time_obs)
-            
-    result = {
-        'visibilities': visibilities,
-        'baselines': baselines_meters,
-        'uvw': uvw,
-        'baseline_pairs': baseline_pairs,
-        'frequencies': frequencies,
-        'time_obs': time_obs,
-        'n_antennas': n_ant,
-        'n_baselines': n_baselines,
-        'n_freq': n_freq,
-        'pixel_altaz': pixel_altaz,
-        'source_names': src_names,
-        'source_az': src_az,
-        'source_alt': src_alt
-    }
-    
-    return result
 
+        if f_idx % 10 == 0:
+            print(f"Processed frequency channel {f_idx}/{n_freq}")
+
+    if Trec_k > 0:
+        # a_eff_m2 now has a sensible default, but still ensure it's positive
+        if a_eff_m2 is None or a_eff_m2 <= 0:
+            raise ValueError(
+                "a_eff_m2 must be provided and >0 when adding thermal noise."
+            )
+
+        print(f"Adding thermal noise with Trec={Trec_k:.1f} K")
+
+        visibilities = add_thermal_noise(
+            visibilities=visibilities,
+            Trec_k=Trec_k,
+            Tsky_eff_k=tsky_weighted,
+            a_eff_m2=a_eff_m2,
+            frequencies=frequencies,
+            integration_time_s=integration_time_s,
+        )
+
+    src_names, src_az, src_alt = get_all_sources_altaz(time_obs)
+
+    result = {
+        "visibilities": visibilities,
+        "baselines": baselines_meters,
+        "uvw": uvw,
+        "baseline_pairs": baseline_pairs,
+        "frequencies": frequencies,
+        "time_obs": time_obs,
+        "n_antennas": n_ant,
+        "n_baselines": n_baselines,
+        "n_freq": n_freq,
+        "pixel_altaz": pixel_altaz,
+        "source_names": src_names,
+        "source_az": src_az,
+        "source_alt": src_alt,
+    }
+
+    return result
 
 def plot_antenna_layout(antenna_mapping, save_path=None):
     """Plot the antenna array layout."""
@@ -926,6 +1022,9 @@ def run_simulation_snapshot(time_obs, antenna_mapping, frequencies, args, output
     time_str_file = time_pst.strftime('%Y%m%d_%H%M%S')
     time_str_log = time_pst.strftime('%Y-%m-%d %H:%M:%S %Z')
     
+    # Extract layout name from path (without .csv extension)
+    layout_name = os.path.splitext(os.path.basename(args.layout))[0]
+    
     print(f"\n--- Processing Snapshot: {time_str_log} ---")
     
     # Determine output directories
@@ -934,10 +1033,10 @@ def run_simulation_snapshot(time_obs, antenna_mapping, frequencies, args, output
         vis_dir = os.path.join(output_base_dir, 'visibilities')
         os.makedirs(skymaps_dir, exist_ok=True)
         os.makedirs(vis_dir, exist_ok=True)
-        vis_filename = os.path.join(vis_dir, f'casm_visibilities_{time_str_file}.npz')
+        vis_filename = os.path.join(vis_dir, f'casm_visibilities_{layout_name}_{time_str_file}.npz')
     else:
         skymaps_dir = 'skymaps'
-        vis_filename = 'casm_visibilities_test.npz' if args.test_baselines else 'casm_visibilities.npz'
+        vis_filename = f'casm_visibilities_{layout_name}_test.npz' if args.test_baselines else f'casm_visibilities_{layout_name}.npz'
 
     # Step 3: Visual Sky Model (400 MHz)
     # Only generating visualization when requested (implicit usually, but good to have)
@@ -1002,7 +1101,9 @@ def run_simulation_snapshot(time_obs, antenna_mapping, frequencies, args, output
             custom_baselines=calc_baselines,
             custom_baseline_pairs=calc_pairs,
             base_sky_maps=base_sky_maps,
-            beam_fwhm_deg=args.beam_fwhm
+            beam_fwhm_deg=args.beam_fwhm,
+            Trec_k=args.trec,
+            integration_time_s=args.exptime
         )
         
         # Save results
@@ -1030,12 +1131,15 @@ def run_time_series_simulation(start_time, duration_hours, timestep_minutes, ant
     """
     end_time = start_time + timedelta(hours=duration_hours)
     
+    # Extract layout name from path (without .csv extension)
+    layout_name = os.path.splitext(os.path.basename(args.layout))[0]
+    
     # Create results directory
     pst = timezone('America/Los_Angeles')
     start_str = start_time.to_datetime(timezone=pst).strftime('%Y%m%d_%H%M')
     end_str = end_time.to_datetime(timezone=pst).strftime('%Y%m%d_%H%M')
     
-    results_dir = f"results_{start_str}_to_{end_str}"
+    results_dir = f"results_{layout_name}_{start_str}_to_{end_str}"
     os.makedirs(results_dir, exist_ok=True)
     print(f"\nStarting Time Series Simulation: {duration_hours} hours, {timestep_minutes} min steps")
     print(f"Output Directory: {results_dir}")
@@ -1098,7 +1202,9 @@ def run_time_series_simulation(start_time, duration_hours, timestep_minutes, ant
             custom_baselines=calc_baselines,
             custom_baseline_pairs=calc_pairs,
             base_sky_maps=base_sky_maps,
-            beam_fwhm_deg=args.beam_fwhm
+            beam_fwhm_deg=args.beam_fwhm,
+            Trec_k=args.trec,
+            integration_time_s=args.exptime
         )
         
         # Collect data
@@ -1115,7 +1221,7 @@ def run_time_series_simulation(start_time, duration_hours, timestep_minutes, ant
     visibilities_stacked = np.stack(visibilities_list, axis=0)
     
     # Save single file
-    vis_filename = os.path.join(results_dir, f'casm_visibilities_{start_str}_to_{end_str}.npz')
+    vis_filename = os.path.join(results_dir, f'casm_visibilities_{layout_name}_{start_str}_to_{end_str}.npz')
     print(f"\nSaving combined results to {vis_filename}...")
     np.savez_compressed(
         vis_filename,
@@ -1141,6 +1247,9 @@ def run_tsky_mode(time_obs, frequencies, args):
     2. Calculate beam-weighted sky temperature as a function of frequency.
     3. Save results to CSV.
     """
+    # Extract layout name from path (without .csv extension)
+    layout_name = os.path.splitext(os.path.basename(args.layout))[0]
+    
     pst = timezone('America/Los_Angeles')
     time_pst = time_obs.to_datetime(timezone=pst)
     time_str = time_pst.strftime('%Y%m%d_%H%M%S')
@@ -1166,11 +1275,11 @@ def run_tsky_mode(time_obs, frequencies, args):
     tsky_weighted = np.sum(sky_maps_visible * beam_visible[np.newaxis, :], axis=1) / beam_sum
     
     # Create output directory
-    output_dir = f"tsky_outputs_{time_str}_beam{args.beam_fwhm:.1f}deg"
+    output_dir = f"tsky_outputs_{layout_name}_{time_str}_beam{args.beam_fwhm:.1f}deg"
     os.makedirs(output_dir, exist_ok=True)
     
     # 3. Save CSV
-    csv_filename = os.path.join(output_dir, f"tsky_weighted_{time_str}_beam{args.beam_fwhm:.1f}deg.csv")
+    csv_filename = os.path.join(output_dir, f"tsky_weighted_{layout_name}_{time_str}_beam{args.beam_fwhm:.1f}deg.csv")
     
     header = "frequency_mhz,tsky_weighted_k"
     data_to_save = np.column_stack([frequencies, tsky_weighted])
@@ -1220,8 +1329,15 @@ def main():
     
     parser.add_argument('--tsky', action='store_true',
                        help='Run in Tsky mode: dump skymaps at min/max freq and beam-weighted Tsky CSV (default: False)')
+    
     parser.add_argument('--beam-fwhm', type=float, default=DEFAULT_BEAM_FWHM,
                        help=f'Primary beam FWHM in degrees (default: {DEFAULT_BEAM_FWHM:.2f} deg, corresponding to {PRIMARY_BEAM_SOLID_ANGLE} deg²)')
+
+    # integration / noise parameters (keep names consistent with generate_visibilities)
+    parser.add_argument('--exptime', type=float, default=1.0,
+                       help='Integration time per visibility sample in seconds (default: 1.0 s)')
+    parser.add_argument('--trec', type=float, default=0.0,
+                       help='Receiver temperature in K for thermal noise (default: 0 K)')
 
     args = parser.parse_args()
     
