@@ -545,7 +545,7 @@ def add_thermal_noise(
         Beam-weighted sky temperature per frequency (K), shape (n_freq,)
     a_eff_m2 : float
         Effective collecting area per antenna (m^2)
-    frequencies : array
+    vis_freqs : array
         Frequencies in MHz
     integration_time_s : float
         Integration time per visibility sample (seconds)
@@ -563,10 +563,15 @@ def add_thermal_noise(
 
     n_baselines, n_freq, n_pol, _ = visibilities.shape
 
-    # Channel bandwidth
+    # Channel bandwidth calculation
+    # NOTE: If visibilities were interpolated from a coarser model grid, 
+    # the noise must still be added at the final visibility frequency resolution
+    # to ensure each channel has independent, correctly-scaled noise.
     if n_freq > 1:
         df = (vis_freqs[-1] - vis_freqs[0]) / (n_freq - 1)
     else:
+        # Fallback for single channel: assumes full band if not specified.
+        # WARNING: This may underestimate noise if the channel is narrow.
         df = FREQ_MAX - FREQ_MIN  # MHz
 
     df_hz = df * 1e6
@@ -806,11 +811,11 @@ def generate_point_source_visibilities(
     alt_deg,
     az_deg,
     flux_jy,
-    frequencies,
+    vis_freqs,
     antenna_mapping,
     use_radec=False,
     time_obs=None,
-    duration_s=1.0,
+    integration_time_s=1.0,
     Trec_k=0.0,
     a_eff_m2=0.2,
     beam_fwhm_deg=None,
@@ -828,16 +833,20 @@ def generate_point_source_visibilities(
         Azimuth (if use_radec=False) or Declination (if use_radec=True) in degrees.
     flux_jy : float
         Flux density of the source in Jy.
-    frequencies : array
-        Frequencies in MHz.
+    vis_freqs : array
+        Frequencies in MHz. Note: For consistency with generate_visibilities, 
+        pass the full output resolution here. Unlike that function, direct 
+        computation is used here (no interpolation), which is more accurate for 
+        point sources but requires the full frequency array for correct 
+        noise scaling in add_thermal_noise.
     antenna_mapping : dict
         Antenna position mapping dictionary.
     use_radec : bool, optional
         Interpret input coordinates as RA/Dec instead of AltAz. Default False.
     time_obs : Time, optional
         Observation time. Default is now.
-    duration_s : float, optional
-        Integration time in seconds. Used for noise calculation.
+    integration_time_s : float, optional
+        Integration time in seconds. Used for noise calculation (matches generate_visibilities).
     Trec_k : float, optional
         Receiver temperature in Kelvin.
     a_eff_m2 : float, optional
@@ -870,7 +879,7 @@ def generate_point_source_visibilities(
         altaz = AltAz(alt=alt_deg * u.deg, az=az_deg * u.deg, obstime=time_obs, location=location)
         coord_label = f"Alt={alt_deg}, Az={az_deg}"
 
-    n_freq = len(frequencies)
+    n_freq = len(vis_freqs)
     baselines_meters, baseline_pairs = calculate_baselines(
         antenna_mapping["positions"]
     )
@@ -902,7 +911,7 @@ def generate_point_source_visibilities(
 
         if curr_beam_att > 0:
             # 3. Calculate UVW
-            uvw = calculate_uvw(baselines_meters, frequencies)
+            uvw = calculate_uvw(baselines_meters, vis_freqs)
 
             # 4. Generate visibilities
             S_app = flux_jy * curr_beam_att
@@ -947,15 +956,15 @@ def generate_point_source_visibilities(
     # 6. Add thermal noise if Treceiver > 0
     if Trec_k > 0:
         print(
-            f"   Adding thermal noise (Duration={duration_s}s, Trec={Trec_k}K, Tsky={np.mean(Tsky_eff_k):.2f}K)..."
+            f"   Adding thermal noise (Integration={integration_time_s}s, Trec={Trec_k}K, Tsky={np.mean(Tsky_eff_k):.2f}K)..."
         )
         visibilities = add_thermal_noise(
             visibilities=visibilities,
             Trec_k=Trec_k,
             Tsky_eff_k=Tsky_eff_k,
             a_eff_m2=a_eff_m2,
-            frequencies=frequencies,
-            integration_time_s=duration_s,
+            vis_freqs=vis_freqs,
+            integration_time_s=integration_time_s,
         )
 
     return visibilities
@@ -966,11 +975,11 @@ def inject_point_source(
     alt_deg,
     az_deg,
     flux_jy,
-    frequencies,
+    vis_freqs,
     antenna_mapping,
     use_radec=False,
     time_obs=None,
-    duration_s=1.0,
+    integration_time_s=1.0,
     Trec_k=0.0,
     a_eff_m2=0.2,
     beam_fwhm_deg=None,
@@ -989,7 +998,7 @@ def inject_point_source(
         Azimuth (if use_radec=False) or Declination (if use_radec=True) in degrees.
     flux_jy : float
         Flux density of the source in Jy.
-    frequencies : array
+    vis_freqs : array
         Frequencies in MHz.
     antenna_mapping : dict
         Antenna position mapping dictionary.
@@ -997,8 +1006,8 @@ def inject_point_source(
         Interpret input coordinates as RA/Dec instead of AltAz. Default False.
     time_obs : Time, optional
         Observation time. Default is now.
-    duration_s : float, optional
-        Integration time in seconds. Used for noise calculation.
+    integration_time_s : float, optional
+        Integration time in seconds. Used for noise calculation (matches generate_visibilities).
     Trec_k : float, optional
         Receiver temperature in Kelvin.
     a_eff_m2 : float, optional
@@ -1018,11 +1027,11 @@ def inject_point_source(
         alt_deg=alt_deg,
         az_deg=az_deg,
         flux_jy=flux_jy,
-        frequencies=frequencies,
+        vis_freqs=vis_freqs,
         antenna_mapping=antenna_mapping,
         use_radec=use_radec,
         time_obs=time_obs,
-        duration_s=duration_s,
+        integration_time_s=integration_time_s,
         Trec_k=Trec_k,
         a_eff_m2=a_eff_m2,
         beam_fwhm_deg=beam_fwhm_deg,
