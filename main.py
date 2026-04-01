@@ -712,7 +712,7 @@ def generate_visibilities(
         )
         / beam_sum
     )
-
+    print(f"Beam-weighted sky temperature: {tsky_weighted}")
     print(f"Computing visibilities for {n_baselines} baselines...")
 
     for f_idx in range(n_freq):
@@ -775,11 +775,12 @@ def generate_visibilities(
 
 
 def generate_point_source_visibilities(
-    ra_deg,
-    dec_deg,
+    alt_deg,
+    az_deg,
     flux_jy,
     frequencies,
     antenna_mapping,
+    use_radec=False,
     time_obs=None,
     duration_s=1.0,
     Trec_k=0.0,
@@ -793,16 +794,18 @@ def generate_point_source_visibilities(
 
     Parameters
     ----------
-    ra_deg : float
-        Right Ascension of the source in degrees.
-    dec_deg : float
-        Declination of the source in degrees.
+    alt_deg : float
+        Altitude (if use_radec=False) or Right Ascension (if use_radec=True) in degrees.
+    az_deg : float
+        Azimuth (if use_radec=False) or Declination (if use_radec=True) in degrees.
     flux_jy : float
         Flux density of the source in Jy.
     frequencies : array
         Frequencies in MHz.
     antenna_mapping : dict
         Antenna position mapping dictionary.
+    use_radec : bool, optional
+        Interpret input coordinates as RA/Dec instead of AltAz. Default False.
     time_obs : Time, optional
         Observation time. Default is now.
     duration_s : float, optional
@@ -830,9 +833,14 @@ def generate_point_source_visibilities(
         lat=OVRO_LAT * u.deg, lon=OVRO_LON * u.deg, height=OVRO_ELEV * u.m
     )
 
-    # 1. Coordinate transformation: RA/Dec -> AltAz -> ENU unit vector
-    coord = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
-    altaz = coord.transform_to(AltAz(obstime=time_obs, location=location))
+    # 1. Coordinate handling
+    if use_radec:
+        coord = SkyCoord(ra=alt_deg * u.deg, dec=az_deg * u.deg, frame="icrs")
+        altaz = coord.transform_to(AltAz(obstime=time_obs, location=location))
+        coord_label = f"RA={alt_deg}, Dec={az_deg}"
+    else:
+        altaz = AltAz(alt=alt_deg * u.deg, az=az_deg * u.deg, obstime=time_obs, location=location)
+        coord_label = f"Alt={alt_deg}, Az={az_deg}"
 
     n_freq = len(frequencies)
     baselines_meters, baseline_pairs = calculate_baselines(
@@ -845,7 +853,7 @@ def generate_point_source_visibilities(
     if altaz.alt.deg <= 0:
         # Source is below horizon.
         print(
-            f"   Source (RA={ra_deg}, Dec={dec_deg}) is below horizon (Alt={altaz.alt.deg:.1f})."
+            f"   Source ({coord_label}) is below horizon (Alt={altaz.alt.deg:.1f})."
         )
         curr_beam_att = 0.0
     else:
@@ -902,6 +910,8 @@ def generate_point_source_visibilities(
             Tsky_eff_k = np.full(n_freq, tsky_val)
         else:
             Tsky_eff_k = tsky_val
+        
+        print(f"   Tsky_eff_k: {Tsky_eff_k}")
             
         # Note: This represents the contribution from the point source itself.
         # In a real observation, one would also have the diffuse sky background (~100K).
@@ -925,11 +935,12 @@ def generate_point_source_visibilities(
 
 def inject_point_source(
     visibilities,
-    ra_deg,
-    dec_deg,
+    alt_deg,
+    az_deg,
     flux_jy,
     frequencies,
     antenna_mapping,
+    use_radec=False,
     time_obs=None,
     duration_s=1.0,
     Trec_k=0.0,
@@ -944,16 +955,18 @@ def inject_point_source(
     ----------
     visibilities : array
         Existing visibilities of shape (n_baselines, n_freq, 2, 2) in Jy.
-    ra_deg : float
-        Right Ascension of the source in degrees.
-    dec_deg : float
-        Declination of the source in degrees.
+    alt_deg : float
+        Altitude (if use_radec=False) or Right Ascension (if use_radec=True) in degrees.
+    az_deg : float
+        Azimuth (if use_radec=False) or Declination (if use_radec=True) in degrees.
     flux_jy : float
         Flux density of the source in Jy.
     frequencies : array
         Frequencies in MHz.
     antenna_mapping : dict
         Antenna position mapping dictionary.
+    use_radec : bool, optional
+        Interpret input coordinates as RA/Dec instead of AltAz. Default False.
     time_obs : Time, optional
         Observation time. Default is now.
     duration_s : float, optional
@@ -974,11 +987,12 @@ def inject_point_source(
         Combined visibilities (original + point source + noise if applicable).
     """
     ps_vis = generate_point_source_visibilities(
-        ra_deg=ra_deg,
-        dec_deg=dec_deg,
+        alt_deg=alt_deg,
+        az_deg=az_deg,
         flux_jy=flux_jy,
         frequencies=frequencies,
         antenna_mapping=antenna_mapping,
+        use_radec=use_radec,
         time_obs=time_obs,
         duration_s=duration_s,
         Trec_k=Trec_k,
