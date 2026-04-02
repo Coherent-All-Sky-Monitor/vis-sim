@@ -49,8 +49,66 @@ DEFAULT_BEAM_FWHM = np.sqrt(PRIMARY_BEAM_SOLID_ANGLE / (2 * np.pi)) * 2 * np.sqr
 SUN_BRIGHTNESS_TEMP = 8.0e5  # K (Approximation for Quiet Sun T_b)
 SUN_DIAMETER_DEG = 1.2       # degrees (Approximation for size at 400 MHz)
 SUN_SIGMA_DEG = SUN_DIAMETER_DEG / 2.355  # FWHM to Gaussian sigma: sigma = FWHM / (2*sqrt(2*ln(2)))
+
+# --- BRIGHT POINT SOURCE PARAMETERS ---
+BRIGHT_SOURCES_PARAMS = {
+    'Cas A':      {'size_deg': 1, 'ra': 350.85, 'dec': 58.81},
+    'Cyg A':      {'size_deg': 1, 'ra': 299.87, 'dec': 40.73},
+    'Tau A':      {'size_deg': 1, 'ra': 83.63,  'dec': 22.01},
+    'Virgo A':    {'size_deg': 1, 'ra': 187.71, 'dec': 12.39},
+    'Hercules A': {'size_deg': 1, 'ra': 252.78, 'dec': 4.99},
+    'Hydra A':    {'size_deg': 1, 'ra': 139.52, 'dec': -12.09},
+    '3C 123':     {'size_deg': 1, 'ra': 69.28,  'dec': 29.67},
+    '3C 295':     {'size_deg': 1, 'ra': 212.83, 'dec': 52.20},
+}
 # target_ants = {4, 6, 7, 8, 9, 10, 11, 12}
 # -----------------------------
+
+def get_bright_source_flux(source_name, freq_mhz, observation_year=2026.0):
+    """
+    Calculates the flux density in Janskys based on Perley-Butler 2017 coefficients.
+    Includes secular decrease for Cas A and Tau A.
+    """
+    
+    # Coefficients based on Perley & Butler (2017)
+    # log10(S) = a0 + a1*log10(nu) + a2*(log10(nu))^2 + ... (nu in GHz)
+    COEFFS = {
+        'Cas A':      [3.3584, -0.7518, -0.0347, -0.0705],
+        'Cyg A':      [3.3498, -1.0022, -0.2246,  0.0227, 0.0425],
+        'Tau A':      [2.9516, -0.2173, -0.0473, -0.0674],
+        'Virgo A':    [2.4466, -0.8116, -0.0483],
+        'Hercules A': [1.8298, -1.0247, -0.0951],
+        'Hydra A':    [1.7795, -0.9176, -0.0843, -0.0139, 0.0295],
+        '3C 123':     [1.8017, -0.7884, -0.1035, -0.0248, 0.0090],
+        '3C 295':     [1.4701, -0.7658, -0.2780, -0.0347, 0.0399]
+    }
+
+    if source_name not in COEFFS:
+        raise ValueError(f"Source {source_name} not in database.")
+
+    # Convert MHz to GHz for the PB2017 formula
+    nu_ghz = freq_mhz / 1000.0
+    log_nu = np.log10(nu_ghz)
+    
+    # Evaluate polynomial
+    coeffs = COEFFS[source_name]
+    log_s = sum(c * (log_nu**i) for i, c in enumerate(coeffs))
+    flux_jy = 10**log_s
+
+    # Secular variations (Epoch 2000.0)
+    # Cas A: ~0.6% to 0.7% decrease per year depending on frequency
+    # Tau A: ~0.17% decrease per year
+    dt = observation_year - 2016
+    
+    if source_name == 'Cas A':
+        # Frequency dependent fading rate (approximate for 300-500 MHz)
+        fade_rate = 0.0046 
+        flux_jy *= (1 - fade_rate)**dt
+    elif source_name == 'Tau A':
+        fade_rate = 0.0025
+        flux_jy *= (1 - fade_rate)**dt
+
+    return flux_jy
 
 def generate_antenna_positions(csv_path):
     """
@@ -270,6 +328,112 @@ def add_sun_to_sky_model(sky_maps, vis_freqs, time_obs, sky_coords_icrs, nside=6
     return sky_maps_sun
 
 
+# def add_bright_sources_to_sky_model(sky_maps, vis_freqs, time_obs, sky_coords_icrs, nside=64):
+#     """
+#     Add bright point sources (Cas A, Cyg A, Tau A) with spectral index to sky maps.
+
+#     sky_maps: array(n_freq, n_pix)
+#     vis_freqs: array of MHz
+#     time_obs: astropy Time
+#     sky_coords_icrs: SkyCoord of HEALPix pixels
+#     """
+#     n_freq, n_pix = sky_maps.shape
+#     source_maps = np.zeros_like(sky_maps)
+
+#     # Pre-calculate pixel area
+#     pixel_area = hp.nside2pixarea(nside)
+
+#     for name, p in BRIGHT_SOURCES_PARAMS.items():
+#         source_coord = SkyCoord(ra=p['ra']*u.deg, dec=p['dec']*u.deg, frame='icrs')
+        
+#         # Find the single HEALPix pixel closest to the source center
+#         sep = source_coord.separation(sky_coords_icrs)
+#         pix_idx = np.argmin(sep.deg)
+
+#         # Frequency-dependent flux density using PB2017 model
+#         S_nu = get_bright_source_flux(name, vis_freqs, observation_year=time_obs.decimalyear)
+
+#         # Convert to brightness temperature per frequency for a single pixel
+#         # Tb = (S * c^2) / (2 * k * nu^2 * Omega_pixel)
+#         nu_hz = vis_freqs * 1e6
+#         Tb_pixel = (S_nu * 1e-26 * C_LIGHT**2) / (2 * K_BOLTZMANN * nu_hz**2 * pixel_area)
+
+#         # Inject only into the nearest pixel
+#         source_maps[:, pix_idx] += Tb_pixel
+
+#         # Log the flux density at 400 MHz for reference
+#         S_400 = get_bright_source_flux(name, 400.0, observation_year=time_obs.decimalyear)
+#         print(f"   Added {name}: flux={S_400:.1f}Jy @ 400MHz, size={p['size_deg']}deg")
+
+#     return sky_maps + source_maps
+
+def add_bright_sources_to_sky_model(sky_maps, vis_freqs, time_obs, nside=64, use_interp=True):
+    """
+    Add bright point sources to HEALPix sky maps using the PB2017 flux model.
+    
+    Parameters:
+    -----------
+    sky_maps : array(n_freq, n_pix)
+        The input sky maps to which sources will be added.
+    vis_freqs : array
+        Frequency array in MHz.
+    time_obs : astropy.time.Time
+        The observation time (used for Cas A/Tau A fading).
+    nside : int
+        HEALPix NSIDE (default 64).
+    use_interp : bool
+        If True, distributes flux to 4 nearest pixels to maintain exact position.
+        If False, puts all flux in the single nearest pixel.
+    """
+    n_freq, n_pix = sky_maps.shape
+    pixel_area = hp.nside2pixarea(nside)
+    
+    # Constants
+    C_LIGHT = 299792458.0
+    K_BOLTZMANN = 1.380649e-23
+    
+    # Current decimal year for secular fading
+    obs_year = time_obs.decimalyear
+
+    # Iterate through sources (Assumes BRIGHT_SOURCES_PARAMS contains RA/Dec)
+    for name, p in BRIGHT_SOURCES_PARAMS.items():
+        # 1. Get Coordinates (Transform from ICRS to Galactic as the map is Galactic)
+        source_icrs = SkyCoord(ra=p['ra']*u.deg, dec=p['dec']*u.deg, frame='icrs')
+        source_gal = source_icrs.galactic
+        
+        # HEALPix uses colatitude (theta) and longitude (phi) in the map's native frame
+        l_rad = source_gal.l.rad
+        b_rad = source_gal.b.rad
+        
+        theta = np.pi/2.0 - b_rad
+        phi = l_rad
+
+        # 2. Calculate Flux Density (PB2017 Model)
+        S_nu = get_bright_source_flux(name, vis_freqs, observation_year=obs_year)
+        
+        # 3. Convert Flux (Jy) to Brightness Temperature (K)
+        # Tb = (S * c^2) / (2 * k * nu^2 * Omega_pix)
+        nu_hz = vis_freqs * 1e6
+        Tb_total = (S_nu * 1e-26 * C_LIGHT**2) / (2 * K_BOLTZMANN * nu_hz**2 * pixel_area)
+
+        # 4. Inject into Map
+        if use_interp:
+            # Distribute flux to 4 neighbors to preserve sub-pixel positioning
+            indices, weights = hp.get_interp_weights(nside, theta, phi)
+            for i, weight in zip(indices, weights):
+                sky_maps[:, i] += Tb_total * weight
+        else:
+            # Hard assignment to the single nearest pixel center
+            pix_idx = hp.ang2pix(nside, theta, phi)
+            sky_maps[:, pix_idx] += Tb_total
+
+        # Logging reference
+        S_400 = get_bright_source_flux(name, 400.0, observation_year=obs_year)
+        print(f"   [Point Source] {name:<10}: {S_400:>7.1f} Jy @ 400MHz (Epoch {obs_year:.2f})")
+
+    return sky_maps
+
+
 def generate_base_sky_model(vis_freqs, nside=64):
     """
     Generate the time-independent component of the sky model (GSM) in Galactic coordinates.
@@ -298,7 +462,7 @@ def generate_base_sky_model(vis_freqs, nside=64):
             print(f"   Error loading cache: {e}. Regenerating...")
             
     print(f"   Pre-computing GSM background for {len(vis_freqs)} channels...")
-    gsm = pygdsm.GlobalSkyModel16(freq_unit='MHz', data_unit='TCMB')
+    gsm = pygdsm.GlobalSkyModel16(freq_unit='MHz', data_unit='T')
     sky_maps = []
     
     for freq in vis_freqs:
@@ -356,9 +520,12 @@ def get_sky_model(vis_freqs, time_obs=None, nside=64, base_sky_maps=None):
     
     # 3. Add the Sun to the sky model (Time dependent)
     sky_maps_sun = add_sun_to_sky_model(sky_maps, vis_freqs, time_obs, sky_coords_icrs, nside=nside)
+
+    # 4. Add bright compact sources (Cas A, Cyg A, Tau A) with spectra
+    sky_maps_full = add_bright_sources_to_sky_model(sky_maps_sun, vis_freqs, time_obs, nside=nside)
     
     # Return the augmented map and coordinates
-    return sky_maps_sun, pixel_directions, pixel_altaz
+    return sky_maps_full, pixel_directions, pixel_altaz
 
 
 def calculate_baselines(antenna_positions):
@@ -545,7 +712,7 @@ def add_thermal_noise(
         Beam-weighted sky temperature per frequency (K), shape (n_freq,)
     a_eff_m2 : float
         Effective collecting area per antenna (m^2)
-    frequencies : array
+    vis_freqs : array
         Frequencies in MHz
     integration_time_s : float
         Integration time per visibility sample (seconds)
@@ -563,10 +730,15 @@ def add_thermal_noise(
 
     n_baselines, n_freq, n_pol, _ = visibilities.shape
 
-    # Channel bandwidth
+    # Channel bandwidth calculation
+    # NOTE: If visibilities were interpolated from a coarser model grid, 
+    # the noise must still be added at the final visibility frequency resolution
+    # to ensure each channel has independent, correctly-scaled noise.
     if n_freq > 1:
         df = (vis_freqs[-1] - vis_freqs[0]) / (n_freq - 1)
     else:
+        # Fallback for single channel: assumes full band if not specified.
+        # WARNING: This may underestimate noise if the channel is narrow.
         df = FREQ_MAX - FREQ_MIN  # MHz
 
     df_hz = df * 1e6
@@ -806,11 +978,11 @@ def generate_point_source_visibilities(
     alt_deg,
     az_deg,
     flux_jy,
-    frequencies,
+    vis_freqs,
     antenna_mapping,
     use_radec=False,
     time_obs=None,
-    duration_s=1.0,
+    integration_time_s=1.0,
     Trec_k=0.0,
     a_eff_m2=0.2,
     beam_fwhm_deg=None,
@@ -828,16 +1000,20 @@ def generate_point_source_visibilities(
         Azimuth (if use_radec=False) or Declination (if use_radec=True) in degrees.
     flux_jy : float
         Flux density of the source in Jy.
-    frequencies : array
-        Frequencies in MHz.
+    vis_freqs : array
+        Frequencies in MHz. Note: For consistency with generate_visibilities, 
+        pass the full output resolution here. Unlike that function, direct 
+        computation is used here (no interpolation), which is more accurate for 
+        point sources but requires the full frequency array for correct 
+        noise scaling in add_thermal_noise.
     antenna_mapping : dict
         Antenna position mapping dictionary.
     use_radec : bool, optional
         Interpret input coordinates as RA/Dec instead of AltAz. Default False.
     time_obs : Time, optional
         Observation time. Default is now.
-    duration_s : float, optional
-        Integration time in seconds. Used for noise calculation.
+    integration_time_s : float, optional
+        Integration time in seconds. Used for noise calculation (matches generate_visibilities).
     Trec_k : float, optional
         Receiver temperature in Kelvin.
     a_eff_m2 : float, optional
@@ -870,7 +1046,7 @@ def generate_point_source_visibilities(
         altaz = AltAz(alt=alt_deg * u.deg, az=az_deg * u.deg, obstime=time_obs, location=location)
         coord_label = f"Alt={alt_deg}, Az={az_deg}"
 
-    n_freq = len(frequencies)
+    n_freq = len(vis_freqs)
     baselines_meters, baseline_pairs = calculate_baselines(
         antenna_mapping["positions"]
     )
@@ -902,7 +1078,7 @@ def generate_point_source_visibilities(
 
         if curr_beam_att > 0:
             # 3. Calculate UVW
-            uvw = calculate_uvw(baselines_meters, frequencies)
+            uvw = calculate_uvw(baselines_meters, vis_freqs)
 
             # 4. Generate visibilities
             S_app = flux_jy * curr_beam_att
@@ -947,15 +1123,15 @@ def generate_point_source_visibilities(
     # 6. Add thermal noise if Treceiver > 0
     if Trec_k > 0:
         print(
-            f"   Adding thermal noise (Duration={duration_s}s, Trec={Trec_k}K, Tsky={np.mean(Tsky_eff_k):.2f}K)..."
+            f"   Adding thermal noise (Integration={integration_time_s}s, Trec={Trec_k}K, Tsky={np.mean(Tsky_eff_k):.2f}K)..."
         )
         visibilities = add_thermal_noise(
             visibilities=visibilities,
             Trec_k=Trec_k,
             Tsky_eff_k=Tsky_eff_k,
             a_eff_m2=a_eff_m2,
-            frequencies=frequencies,
-            integration_time_s=duration_s,
+            vis_freqs=vis_freqs,
+            integration_time_s=integration_time_s,
         )
 
     return visibilities
@@ -966,11 +1142,11 @@ def inject_point_source(
     alt_deg,
     az_deg,
     flux_jy,
-    frequencies,
+    vis_freqs,
     antenna_mapping,
     use_radec=False,
     time_obs=None,
-    duration_s=1.0,
+    integration_time_s=1.0,
     Trec_k=0.0,
     a_eff_m2=0.2,
     beam_fwhm_deg=None,
@@ -989,7 +1165,7 @@ def inject_point_source(
         Azimuth (if use_radec=False) or Declination (if use_radec=True) in degrees.
     flux_jy : float
         Flux density of the source in Jy.
-    frequencies : array
+    vis_freqs : array
         Frequencies in MHz.
     antenna_mapping : dict
         Antenna position mapping dictionary.
@@ -997,8 +1173,8 @@ def inject_point_source(
         Interpret input coordinates as RA/Dec instead of AltAz. Default False.
     time_obs : Time, optional
         Observation time. Default is now.
-    duration_s : float, optional
-        Integration time in seconds. Used for noise calculation.
+    integration_time_s : float, optional
+        Integration time in seconds. Used for noise calculation (matches generate_visibilities).
     Trec_k : float, optional
         Receiver temperature in Kelvin.
     a_eff_m2 : float, optional
@@ -1018,11 +1194,11 @@ def inject_point_source(
         alt_deg=alt_deg,
         az_deg=az_deg,
         flux_jy=flux_jy,
-        frequencies=frequencies,
+        vis_freqs=vis_freqs,
         antenna_mapping=antenna_mapping,
         use_radec=use_radec,
         time_obs=time_obs,
-        duration_s=duration_s,
+        integration_time_s=integration_time_s,
         Trec_k=Trec_k,
         a_eff_m2=a_eff_m2,
         beam_fwhm_deg=beam_fwhm_deg,
@@ -1066,11 +1242,10 @@ def get_bright_sources_coords(time_obs):
     """
     Get coordinates of bright sources including the Sun.
     """
-    bright_sources = {
-        'Cas A': SkyCoord(ra=350.85*u.deg, dec=58.81*u.deg, frame='icrs'),
-        'Cyg A': SkyCoord(ra=299.87*u.deg, dec=40.73*u.deg, frame='icrs'),
-        'Tau A': SkyCoord(ra=83.63*u.deg, dec=22.01*u.deg, frame='icrs')
-    }
+    bright_sources = {}
+    for name, p in BRIGHT_SOURCES_PARAMS.items():
+        bright_sources[name] = SkyCoord(ra=p['ra']*u.deg, dec=p['dec']*u.deg, frame='icrs')
+    
     # Add position of the sun
     sun_coord = get_sun(time_obs)
     bright_sources['Sun'] = sun_coord
@@ -1218,14 +1393,16 @@ def plot_sky_map_with_beam(sky_maps, pixel_altaz, vis_freqs, time_obs, output_di
             # Add positions of bright sources
             for name, coord in bright_sources.items():
                 altaz = coord.transform_to(AltAz(obstime=time_obs, location=location))
-                if altaz.alt.deg > 0 and name != 'Sun':
+                if altaz.alt.deg > 0:
                     az_rad = np.radians(altaz.az.deg)
                     r = 90.0 - altaz.alt.deg
-                    ax.plot(az_rad, r, 'o', fillstyle='none', label=name, ms=10)
-                if name == 'Sun' and altaz.alt.deg > 0:
-                    az_rad = np.radians(altaz.az.deg)
-                    r = 90.0 - altaz.alt.deg
-                    ax.plot(az_rad, r, marker='*', color='orange', markersize=5, label='Sun')
+                    if name != 'Sun':
+                        ax.plot(az_rad, r, 'o', fillstyle='none', label=name, ms=10)
+                        # Add text label slightly offset
+                        # ax.text(az_rad, r + 2, name, color='black', fontsize=8, ha='center', va='bottom')
+                    else:
+                        ax.plot(az_rad, r, marker='*', color='orange', markersize=5, label='Sun')
+                        ax.text(az_rad, r + 2, 'Sun', color='orange', fontsize=8, ha='center', va='bottom', weight='bold')
             
             ax.legend(loc='upper right', bbox_to_anchor=(1.1, 1.1))
             

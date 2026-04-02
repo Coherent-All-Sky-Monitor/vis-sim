@@ -113,7 +113,7 @@ vis = generate_point_source_visibilities(
     frequencies,
     antenna_mapping,
     time_obs=time_obs,
-    duration_s=1.0,
+    integration_time_s=1.0,
     Trec_k=50,
     a_eff_m2=0.2,
     beam_fwhm_deg=None,
