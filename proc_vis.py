@@ -6,11 +6,61 @@ import os
 import gc
 from datetime import datetime
 
+HEADER_SIZE = 4096
+
+
+def has_header(filepath: str) -> bool:
+    """Check if a visibility file has a 4096-byte ASCII header."""
+    with open(filepath, "rb") as f:
+        raw = f.read(HEADER_SIZE)
+    text = raw.decode("ascii", errors="ignore")
+    return "HDR_SIZE" in text
+
+def parse_corr_header(filepath: str) -> dict[str, str]:
+    """
+    Read and parse the 4096-byte ASCII header from a visibility file.
+
+    Parameters
+    ----------
+    filepath : str
+        Path to a .dat visibility file with header.
+
+    Returns
+    -------
+    dict
+        Header key-value pairs as strings.
+    """
+    with open(filepath, "rb") as f:
+        raw = f.read(HEADER_SIZE)
+    text = raw.decode("ascii", errors="ignore")
+    header = {}
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            header[parts[0]] = parts[1].strip()
+    return header
+
+def get_header_offset(filepath: str) -> tuple[int, dict | None]:
+    """
+    Detect header presence and return offset + parsed header.
+
+    Returns
+    -------
+    tuple of (int, dict or None)
+        (4096, header_dict) if header present, (0, None) if not.
+    """
+    if has_header(filepath):
+        return HEADER_SIZE, parse_corr_header(filepath)
+    return 0, None
+
 # --- Configuration ---
-BASE_PATH = "/data/casm/visibilities_64ant/"
-BASE_STR = "2026-02-02-01:17:07"
+BASE_PATH = "/mnt/nvme3/data/casm/visibilities_64ant/"
+BASE_STR = "2026-03-27-07:56:53"
 FILE_PATTERN = BASE_STR + ".*"
-OUTPUT_FILE = f"/home/casm/software/casm_xengine/scripts/advait/{BASE_STR}_vis_combined.npy"
+OUTPUT_FILE = f"/home/casm/software/casm_xengine/scripts/advait/{BASE_STR}_vis_combined2.npy"
 CHECK_INTERVAL = 20 * 60  # 20 minutes
 MIN_SIZE_GB = 6.0         # Ignore files smaller than this
 START_IDX = 0             # Only process files with index >= START_IDX
@@ -19,7 +69,7 @@ STOP_IDX = -1            # Process all files if -1
 NSIG = 128
 NCHAN = 3072
 # IND = np.array([2,4,13,15,16,36,37,44,45,46,48,49])
-IND = np.array([25,26,27,29,30,32,33,35,6,8,9,11])
+IND = np.array([8,9,6,27,30,35,32,25,33,26,51,49,55,53,59,56])
 NIND = len(IND)
 NBASELINE = NSIG * (NSIG + 1) // 2
 
@@ -71,7 +121,10 @@ while True:
         for fpath in new_files:
             try:
                 # Load raw
-                xcorrs = np.fromfile(fpath, dtype=np.int32).reshape(-1, NCHAN, NBASELINE, 2)
+                offset, file_header = get_header_offset(fpath)
+                raw = np.fromfile(fpath, dtype=np.int32, offset=offset)
+                ntime = raw.size // (NCHAN * NBASELINE * 2)
+                xcorrs = raw.reshape(-1, NCHAN, NBASELINE, 2)
                 
                 # Reconstruct
                 vis_mat = reconstruct_vis_mat(NSIG, xcorrs)
